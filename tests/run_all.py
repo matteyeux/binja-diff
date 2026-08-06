@@ -19,6 +19,7 @@ TESTS = (
     "test_symbols.py",
     "test_scope.py",
     "test_cli.py",
+    "test_similarity.py",
 )
 
 #: Needs a real Binary Ninja; skips itself cleanly when unavailable.

@@ -27,7 +27,15 @@ because it pins numpy >= 2 and pulls in scipy and scikit-learn. Use that
 interpreter for anything touching qbindiff:
 
 ```bash
-.venv-qbindiff-312/bin/python ...
+.venv/bin/python ...
+```
+
+Binary Ninja's own API is not installed in that virtualenv, so anything that
+needs it — `test_live.py`, the CLI, a similarity session — wants the app's
+Python on the path as well:
+
+```bash
+PYTHONPATH="/Applications/Binary Ninja.app/Contents/Resources/python" .venv/bin/python ...
 ```
 
 Two failure modes are worth recognizing on sight, because both look like
@@ -50,13 +58,18 @@ minimal Linux image that library is often absent and surfaces as
 ## Running the tests
 
 ```bash
-.venv-qbindiff-312/bin/python binja_diff/tests/run_all.py
+PYTHONPATH="/Applications/Binary Ninja.app/Contents/Resources/python" \
+  .venv/bin/python binja_diff/tests/run_all.py
 ```
 
 There are two tiers.
 
 `test_live.py` needs a **headless** licence, which the Personal edition does
-not grant: it prints SKIP on a machine that only has the GUI. A headless host
+not grant: it prints SKIP on a machine that only has the GUI. It also registers
+the package by path through `bootstrap.register_package()` rather than putting
+the checkout's parent on `sys.path` — that only ever worked where the directory
+happened to be called `binja_diff`, and went unnoticed for as long as the file
+was skipping. A headless host
 is worth arranging before touching classification — every bug in `align.py`
 that survived more than one round did so because it could only be reproduced
 against real Binary Ninja rendering, and the stub encoded what the author
@@ -86,7 +99,7 @@ of the diff classifier, and cheap:
 printf 'int check(int x){return x>42?x*3:x+7;}\nint main(){return check(10);}\n' > /tmp/a.c
 sed 's/42/99/' /tmp/a.c > /tmp/b.c
 gcc -O0 -o /tmp/a /tmp/a.c && gcc -O0 -o /tmp/b /tmp/b.c
-.venv-qbindiff-312/bin/python binja_diff/tests/test_live.py /tmp/a /tmp/b
+.venv/bin/python binja_diff/tests/test_live.py /tmp/a /tmp/b
 ```
 
 Two things to know about the stubbed harness:
@@ -263,6 +276,7 @@ flowchart TD
         alignMod["align.py: block and line alignment"]
         persistMod["persist.py: save/restore, RestoreTask"]
         scopeMod["scope.py: kexts and SEP modules"]
+        similarityMod["similarity.py: Binary Similarity provider"]
         symbolsMod["symbols.py: porting function names"]
     end
     subgraph uiLayer [ui: Qt]
@@ -276,6 +290,8 @@ flowchart TD
     end
     backend --> engine
     scopeMod --> engine
+    engine --> similarityMod
+    alignMod --> similarityMod
     engine --> persistMod
     engine --> symbolsMod
     engine --> diffview
@@ -413,6 +429,93 @@ by name. An untouched primary has no parts to mirror, and there "everything"
 falls back to loading the file in full — for SEP, via `load_all_modules` in
 sep-binja's API (26 modules, bounded). A kernelcache is refused there instead,
 and says why: 256 kexts is exactly the diff scoping exists to prevent.
+
+### QBinDiff as a Binary Similarity provider
+
+`core/similarity.py` registers QBinDiff with Binary Ninja's Binary Similarity
+sessions (Ultimate), where it runs beside Google BinDiff and WARP and a
+resolver can weigh the three against each other. It is an adapter over what
+already exists — `backend.ProgramBackendBinja` and `align` — and registration
+happens for headless as well as UI, since a session is driven by the Python API
+either way. `register()` returns False and logs one line on a Binary Ninja whose
+`binaryninja.similarity` will not import, so nothing changes on older versions.
+
+Four things it has to get right:
+
+- **The reported similarity is `align.text_similarity`, not QBinDiff's.** A
+  result carries 0..255 and a resolver *thresholds* on it to decide what to
+  apply automatically. QBinDiff's own number is the MinHash described above, so
+  feeding it in would refuse to port names for exactly the functions that
+  changed slightly. Confidence still comes from QBinDiff, which is what belief
+  propagation is good at. `scoreByInstructions` turns this off for anyone who
+  wants the raw score.
+- **Scheduling filters reporting, not work.** QBinDiff solves an assignment
+  over every function pair, so a node's scheduled entities cannot narrow the
+  computation. Excluding functions in Node Configuration makes a session
+  quieter, not faster — the opposite of `core/scope.py`, where cutting the
+  input is the whole point.
+- **The other node is reached through the graph.** Naming and rendering a
+  result need the node holding the target, and the provider is handed only one.
+  `node_by_id()` walks `incoming_nodes` / `outgoing_nodes` rather than caching
+  node references, which for a node backed by a `.bndb` would hold its database
+  open for the life of the session.
+- **A target entity may not exist yet.** QBinDiff matches functions the session
+  never listed, and a result can only point at an entity, so `_report` creates
+  one with `create_entity()` before adding the result.
+
+Entity ids are looked up per visit (`entity_index`), never cached: they change
+as a session runs, and a stale index attaches results to the wrong function.
+
+**The provider builds its own flow graphs; `DiffRenderer` colours whole
+blocks.** That renderer takes address *ranges* and paints them itself, a basic
+block at a time, so one changed instruction washes everything around it — and
+its three annotation types (Added/Removed/Changed) cannot express an
+operand-only difference at all. `diff_graphs()` therefore lays out both
+functions with `create_graph()` and sets `DisassemblyTextLine.highlight` per
+line, which the core stores and the widget renders; the graphs go into the
+render context directly with `add_flow_graph`. Yellow is a changed
+instruction, green one only in the new build, red one only in the old, and a
+block that exists on a single side is filled whole because that *is* a
+whole-block fact. `LineStatus.MINOR` is deliberately left plain: in a rebased
+binary it is most of the lines, and colouring it hides the one instruction that
+matters. The linear views stay with `DiffRenderer` — the core owns that
+rendering, and ranges are enough for it.
+
+**The render context's `preferred_view_type` has to be honoured**, even though
+the API calls it a preference a provider may ignore: ignoring it renders
+disassembly whichever tab the reader picks, which is a view selector that does
+nothing. `requested_level()` maps the context's request onto a `RenderLevel`, which
+drives all three of the block alignment, `create_graph(graph_type=...)` and the
+linear factory.
+
+A **language representation** — Pseudo C, Pseudo Rust — arrives as a *name*
+rather than a `FunctionGraphType`, and is a rendering of HLIL rather than a
+level of its own. Treating it as unrecognised and falling back to disassembly
+is not a harmless default: the panes still showed Pseudo C (the host renders
+what it was asked for), while the annotations were computed from disassembly
+rows, so the whole function lit up. `RenderLevel` therefore carries both — HLIL
+for the comparison, the language for `create_graph` and
+`single_function_language_representation`. The two share block structure, so
+the pairing is HLIL's while the lines drawn into it are the language's; note
+that at those levels `BasicBlock.start` is an instruction *index*, not an
+address, which is fine because it is only ever used as a key within one
+rendering. `ensure_il()` runs first, since a graph of IL that has not
+been generated is one "Loading..." node.
+
+**Do not name a helper after one of `SimilarityProvider`'s private callbacks.**
+The base class binds `_visit_node`, `_visit_node_edge`, `_get_name`, `_apply`,
+`_render`, `_free` and the two ref-count hooks as the C callbacks the core
+calls, each taking a leading `ctxt`. A subclass method called `_render` replaces
+that dispatcher, so the core calls it with the dispatcher's arguments: the
+provider rendered nothing and the only sign was an "Exception ignored on calling
+ctypes callback function" line. Override the `perform_*` methods, and give
+helpers names of their own — `_render_result`, here.
+
+**Binary Ninja's own apply keeps a real symbol on the receiving side**, the
+same rule `core/symbols.py` follows. `SimilarityApplySuccess` therefore does
+not promise a rename: applying onto a function called `_start` succeeds and
+changes nothing. A test that wants to see a name move has to pick a pair whose
+target is still `sub_...`.
 
 ### Porting symbols writes to a real database
 
