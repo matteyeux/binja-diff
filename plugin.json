@@ -25,6 +25,6 @@
       "Windows": "Copy to `%APPDATA%\\\\Binary Ninja\\\\plugins` or use the Plugin Manager",
       "Linux": "Copy to `~/.binaryninja/plugins/` or use the Plugin Manager"
    },
-   "version": "1.0.0",
-   "minimumbinaryninjaversion": 9757
+   "version": "1.1.0",
+   "minimumbinaryninjaversion": 10271
 }
