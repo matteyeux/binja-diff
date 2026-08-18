@@ -109,11 +109,32 @@ def _register_ui() -> None:
     Menu.mainMenu("Plugins").addAction("Binary Diff", "Binary Diff")
 
 
-if core_ui_enabled():
-    _reason = dependency_error()
-    if _reason is not None:
-        log_warn(_install_hint(_reason), "binja-diff")
-    else:
+def _register_similarity_provider() -> None:
+    """Offer QBinDiff to Binary Similarity sessions, headless included.
+
+    Separate from the UI registration on purpose: a provider is driven by the
+    session API, which works in a headless script as well as in the sidebar,
+    and it is skipped quietly on a Binary Ninja that has no similarity API.
+    """
+
+    from .core.similarity import register
+
+    register()
+
+
+_reason = dependency_error()
+if _reason is not None:
+    log_warn(_install_hint(_reason), "binja-diff")
+else:
+    try:
+        _register_similarity_provider()
+    except Exception as exc:  # pragma: no cover - depends on the host version
+        import traceback
+
+        log_error(traceback.format_exc(), "binja-diff")
+        log_error(f"binja-diff could not register its similarity provider: {exc}", "binja-diff")
+
+    if core_ui_enabled():
         try:
             _register_ui()
         except Exception as exc:  # pragma: no cover - depends on the host UI

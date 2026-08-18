@@ -11,10 +11,10 @@ Defaults to diffing two system binaries against each other.
 
 from __future__ import annotations
 
+import importlib.util
 import sys
+import time
 from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 #: Added by the Binary Ninja installer for GUI use; not always on sys.path
 #: for an arbitrary interpreter.
@@ -27,6 +27,17 @@ try:
 except Exception as exc:  # pragma: no cover - depends on the host
     print(f"SKIP: Binary Ninja is not importable here ({exc.__class__.__name__}: {exc})")
     raise SystemExit(0) from None
+
+# Registered by path rather than by importing the parent directory: the
+# checkout's own name is not a valid module name. Loaded the same way, since
+# importing it through the package would be circular.
+_spec = importlib.util.spec_from_file_location(
+    "_bootstrap", Path(__file__).resolve().parent / "bootstrap.py"
+)
+assert _spec is not None and _spec.loader is not None
+_bootstrap = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_bootstrap)
+_bootstrap.register_package()
 
 
 def check(label: str, condition: bool, detail: str = "") -> None:
@@ -526,6 +537,219 @@ def test_kernelcache_scoping():
         bv.file.close()
 
 
+def test_similarity_provider(primary_path: str, secondary_path: str):
+    """Drive a real Binary Similarity session through the QBinDiff provider.
+
+    Only the Ultimate edition has the similarity API, so this skips elsewhere.
+    Nothing below can be checked against the stub: the session owns the entity
+    ids, calls the provider on its own threads, and dispatches the callbacks
+    through the core — which is how `_render` shadowing the base class's own
+    callback went unnoticed until a session actually rendered something.
+    """
+
+    print("QBinDiff as a similarity provider")
+    try:
+        from binaryninja import similarity
+    except Exception as exc:
+        print(f"  (no similarity API here: {exc.__class__.__name__}; skipping)")
+        return
+
+    from binja_diff.core.similarity import PROVIDER_NAME
+
+    names = [t.name for t in similarity.SimilarityProviderType]
+    check("the provider is registered", PROVIDER_NAME in names, f"{names}")
+    if PROVIDER_NAME not in names:
+        return
+
+    provider_type = similarity.SimilarityProviderType[PROVIDER_NAME]
+    settings = provider_type.get_default_settings()
+    check("its settings carry our schema", settings.get_double("qbindiff.tradeoff") > 0)
+    provider = provider_type.create(settings)
+    check("and it creates a provider", provider is not None)
+
+    session = similarity.SimilaritySession()
+    session.add_provider(provider)
+    # The same binary on both sides: every function must match itself, which is
+    # the one outcome that needs no judgement about what "similar" means.
+    reference = similarity.SimilaritySessionNode(binaryninja.load(primary_path))
+    target = similarity.SimilaritySessionNode(binaryninja.load(primary_path))
+    session.graph.add_node(reference)
+    session.graph.add_node(target)
+    session.graph.add_edge(reference, target)
+
+    completion = session.run()
+    waited = 0.0
+    while not completion.is_finished and waited < 300:
+        time.sleep(0.2)
+        waited += 0.2
+    check("the session finished", completion.is_finished, f"after {waited:.0f}s")
+
+    from binja_diff.core.engine import is_generated_name
+
+    scored = []
+    sample = None
+    for entity_id in target.entities:
+        for result_id in target.get_results(entity_id):
+            result = target.get_result(result_id)
+            scored.append(result.similarity)
+            # Sample a pair whose receiving side has no real name: Binary
+            # Ninja's own apply keeps an existing symbol, so `_start` would
+            # report success and rename nothing.
+            func = target.get_entity_function(entity_id)
+            if sample is None and func is not None and is_generated_name(func.name):
+                sample = (entity_id, result_id, result)
+
+    check("results came back", len(scored) > 0, f"{len(scored)} results")
+    if sample is None:
+        print("  (every function here carries a symbol; skipping the apply checks)")
+        return
+    check(
+        "a binary against itself is all 255s",
+        all(value == 255 for value in scored),
+        f"lowest {min(scored)}",
+    )
+
+    entity_id, result_id, result = sample
+    name = provider.get_name(target, entity_id, result_id)
+    check("the match has a name", bool(name), f"{name!r}")
+
+    # Renaming the reference and asking again: the name must come from the live
+    # function, not from what the entity recorded when the session ran.
+    other = target.incoming_nodes[0] if target.incoming_nodes else None
+    renamed = other.get_entity_function(result.target.entity_id) if other else None
+    if renamed is not None:
+        renamed.name = "renamed_after_the_run"
+        check(
+            "and it is read live",
+            provider.get_name(target, entity_id, result_id) == "renamed_after_the_run",
+            f"{provider.get_name(target, entity_id, result_id)!r}",
+        )
+        status = provider.apply(target, entity_id, result_id)
+        check(
+            "applying transfers it",
+            status == similarity.SimilarityApplyStatus.SimilarityApplySuccess,
+            f"{status}",
+        )
+        check(
+            "onto the target function",
+            target.get_entity_function(entity_id).name == "renamed_after_the_run",
+        )
+
+    context = similarity.SimilarityRenderContext()
+    provider.render(target, entity_id, context, result_id)
+    views = context.views
+    check("rendering produces views", len(views) > 0, f"{len(views)} views")
+    check("graph and linear, per side", len(views) >= 4, f"{[v.group for v in views]}")
+    tinted, plain = _count_tinted(views)
+    # The same function on both sides: colouring anything here would be the
+    # whole-block wash this rendering exists to avoid.
+    check("identical functions are left plain", tinted == 0, f"{tinted} tinted lines")
+    check("and their lines were still rendered", plain > 0, f"{plain} plain lines")
+
+    _check_view_levels(similarity, provider, target, entity_id, result_id)
+    _check_changed_pair_is_tinted(similarity, provider_type, primary_path, secondary_path)
+
+
+def _check_view_levels(similarity, provider, target, entity_id, result_id):
+    """The header's view selector must actually change what is rendered.
+
+    The context carries the level as a preference a provider may ignore; a
+    provider that does ignore it renders disassembly whichever tab is picked,
+    which is indistinguishable from a broken control.
+    """
+
+    from binaryninja.enums import FunctionGraphType
+
+    from binja_diff.core.similarity import requested_level
+
+    rendered = {}
+    # A language representation is asked for by name, and is a rendering of
+    # HLIL rather than a level of its own -- which is why it needs its own row
+    # here: falling back to disassembly for it painted the whole function.
+    for label, graph_type, expected in (
+        ("Disassembly", FunctionGraphType.NormalFunctionGraph, ("Disassembly", None)),
+        ("LLIL", FunctionGraphType.LowLevelILFunctionGraph, ("LLIL", None)),
+        ("MLIL", FunctionGraphType.MediumLevelILFunctionGraph, ("MLIL", None)),
+        ("HLIL", FunctionGraphType.HighLevelILFunctionGraph, ("HLIL", None)),
+        ("Pseudo C", "Pseudo C", ("HLIL", "Pseudo C")),
+        ("Pseudo Rust", "Pseudo Rust", ("HLIL", "Pseudo Rust")),
+    ):
+        level = label
+        context = similarity.SimilarityRenderContext()
+        context.preferred_view_type = graph_type
+        asked = requested_level(context)
+        check(f"{label} is recognised", (asked.level, asked.language) == expected, f"{asked}")
+        provider.render(target, entity_id, context, result_id)
+        graphs = [view.graph for view in context.views if view.graph is not None]
+        first = ""
+        if graphs and graphs[0].nodes and graphs[0].nodes[0].lines:
+            first = str(graphs[0].nodes[0].lines[0]).strip()
+        rendered[level] = first
+        check(f"{label} renders", bool(graphs) and bool(first), f"{len(graphs)} graphs, {first!r}")
+
+    ils = ["Disassembly", "LLIL", "MLIL", "HLIL"]
+    check(
+        "the IL levels each render their own text",
+        len({rendered[level] for level in ils}) == len(ils),
+        f"{ {level: rendered[level] for level in ils} }",
+    )
+    # Two language representations can agree on a function that uses nothing
+    # specific to either, so they are only checked against the IL they render.
+    check(
+        "and a language representation is not raw HLIL",
+        rendered["Pseudo C"] != rendered["HLIL"],
+        f"{rendered['Pseudo C']!r} vs {rendered['HLIL']!r}",
+    )
+
+
+def _count_tinted(views) -> tuple[int, int]:
+    """Lines carrying a highlight, and lines left alone, across every graph."""
+
+    tinted = plain = 0
+    for view in views:
+        if view.graph is None:
+            continue
+        for node in view.graph.nodes:
+            for line in node.lines:
+                if line.highlight is not None and "none" not in str(line.highlight):
+                    tinted += 1
+                else:
+                    plain += 1
+    return tinted, plain
+
+
+def _check_changed_pair_is_tinted(similarity, provider_type, primary_path, secondary_path):
+    """A pair that really differs must colour instructions, not everything."""
+
+    session = similarity.SimilaritySession()
+    session.add_provider(provider_type.create(provider_type.get_default_settings()))
+    reference = similarity.SimilaritySessionNode(binaryninja.load(primary_path))
+    target = similarity.SimilaritySessionNode(binaryninja.load(secondary_path))
+    session.graph.add_node(reference)
+    session.graph.add_node(target)
+    session.graph.add_edge(reference, target)
+    completion = session.run()
+    waited = 0.0
+    while not completion.is_finished and waited < 300:
+        time.sleep(0.2)
+        waited += 0.2
+
+    provider = session.providers[0] if hasattr(session, "providers") else None
+    for entity_id in target.entities:
+        for result_id in target.get_results(entity_id):
+            result = target.get_result(result_id)
+            if result.similarity == 255:
+                continue
+            context = similarity.SimilarityRenderContext()
+            (provider or provider_type.create(provider_type.get_default_settings())).render(
+                target, entity_id, context, result_id
+            )
+            tinted, _plain = _count_tinted(context.views)
+            check("a differing pair tints instructions", tinted > 0, f"{tinted} tinted")
+            return
+    print("  (no differing pair between these two binaries; skipping)")
+
+
 def test_database_round_trip(source_path: str):
     """A .bndb must load with its saved analysis intact and diff normally."""
 
@@ -613,6 +837,7 @@ def main() -> int:
         test_graph_line_highlighting(result)
         test_saved_diff_round_trip(result, primary_path)
         test_kernelcache_scoping()
+        test_similarity_provider(primary_path, secondary_path)
         test_database_round_trip(primary_path)
     finally:
         primary_bv.file.close()

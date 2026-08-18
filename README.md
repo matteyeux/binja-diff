@@ -17,6 +17,7 @@ five levels: control flow graph, assembly, LLIL, MLIL and HLIL.
 - Save and restore diffs from the BNDB or json file
 - Port function names from one binary to the other
 - Diff a single kext from a kernelcache, or one SEP module
+- QBinDiff as a provider for Binary Similarity sessions
 
 ## Requirements
 
@@ -53,6 +54,30 @@ Expect this to take a while on real firmware. Matching is quadratic in the
 number of functions. sep-firmware M5 26.5 against 26.5.2 takes about 38 minutes.
 Saving the result is worth it: restoring one costs only the reload of the second
 binary.
+
+### Binary Similarity
+
+QBinDiff also registers as a provider for Binary Ninja's **Binary Similarity**
+sidebar (Ultimate), alongside Google BinDiff and WARP, so a session can weigh
+all three against each other. It works headlessly too:
+
+```python
+from binaryninja import SimilarityProviderType, SimilaritySession
+
+provider_type = SimilarityProviderType["QBinDiff"]
+session = SimilaritySession()
+session.add_provider(provider_type.create(provider_type.get_default_settings()))
+```
+
+The similarity it reports is the share of a function's lines that did not
+change, the same number the match table shows, because a resolver thresholds on
+it to decide what to apply.
+
+Rendering a result colours **individual instructions** rather than whole blocks:
+yellow for a changed instruction, green for one only in the new build, red for
+one only in the old. A block that exists on a single side is filled whole, and
+lines that differ only in an address or a register are left plain — in a rebased
+binary those are most of the lines, and colouring them hides the real change.
 
 ### Reading the diff
 

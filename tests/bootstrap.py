@@ -29,10 +29,19 @@ def install() -> None:
         spec.loader.exec_module(module)
         module.install()
 
-    # The package directory is the checkout itself, whose name ("binja-diff")
-    # is not a valid module name — inside Binary Ninja it goes by its plugin
-    # folder name anyway. Register it by path under the name the tests import,
-    # rather than putting its parent on sys.path.
+    register_package()
+
+
+def register_package() -> None:
+    """Make the checkout importable as ``binja_diff``, whatever it is called.
+
+    The package directory is the checkout itself, whose name ("binja-diff-2")
+    is not a valid module name — inside Binary Ninja it goes by its plugin
+    folder name anyway. Register it by path under the name the tests import,
+    rather than putting its parent on sys.path and hoping the directory there
+    is called the right thing.
+    """
+
     if "binja_diff" not in sys.modules:
         spec = importlib.util.spec_from_file_location(
             "binja_diff",
