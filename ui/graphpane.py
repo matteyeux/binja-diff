@@ -30,24 +30,31 @@ from PySide6.QtWidgets import (
 )
 
 from ..core.align import (
-    IL_LEVELS,
     BlockAlignment,
     BlockStatus,
+    RenderLevel,
     align_blocks,
     align_line_statuses,
+    available_levels,
+    ensure_rendering,
     il_basic_blocks,
 )
 from . import theme
 
 
-def build_graph(func, level: str):
-    """Lay out a function's CFG and index its nodes by basic block address."""
+def build_graph(func, level: RenderLevel):
+    """Lay out a function's CFG and index its nodes by basic block address.
+
+    At IL levels and languages ``BasicBlock.start`` is an instruction index, not
+    an address; it is only ever a key within one rendering, so that is fine.
+    """
 
     if func is None:
         return None, {}
 
-    graph_type, _factory = IL_LEVELS[level]
-    graph = func.create_graph(graph_type=graph_type, settings=DisassemblySettings())
+    # A graph of IL that has not been generated is a single "Loading..." node.
+    ensure_rendering(func, level)
+    graph = func.create_graph(graph_type=level.graph_type, settings=DisassemblySettings())
     # Nodes are not populated until layout completes.
     graph.layout_and_wait()
 
@@ -103,10 +110,15 @@ class GraphPane(QWidget):
 
 
 class GraphDiffTab(QWidget):
-    """Basic-block diff: two CFGs plus an IL-level selector and a legend."""
+    """Basic-block diff: two CFGs plus a view selector and a legend.
+
+    A language representation is laid out from its own graph but paired on
+    HLIL's blocks, which it shares; only the lines drawn into them differ.
+    """
 
     def __init__(self, parent: QWidget):
         super().__init__(parent)
+        self._levels = available_levels()
         self._left_bv = None
         self._right_bv = None
         self._left_func = None
@@ -117,10 +129,10 @@ class GraphDiffTab(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
 
         header = QHBoxLayout()
-        header.addWidget(QLabel("IL level:", self))
+        header.addWidget(QLabel("View:", self))
         self.level_combo = QComboBox(self)
-        self.level_combo.addItems(list(IL_LEVELS))
-        self.level_combo.currentTextChanged.connect(self._reload)
+        self.level_combo.addItems([level.name for level in self._levels])
+        self.level_combo.currentIndexChanged.connect(lambda _index: self._reload())
         header.addWidget(self.level_combo)
         header.addSpacing(16)
 
@@ -156,8 +168,8 @@ class GraphDiffTab(QWidget):
         return swatch
 
     @property
-    def level(self) -> str:
-        return self.level_combo.currentText()
+    def level(self) -> RenderLevel:
+        return self._levels[max(self.level_combo.currentIndex(), 0)]
 
     def set_views(self, left_bv, right_bv) -> None:
         """Rebuild the graph widgets; they bind a BinaryView at construction."""
@@ -186,7 +198,7 @@ class GraphDiffTab(QWidget):
         level = self.level
 
         if left_func is not None and right_func is not None:
-            self._alignment = align_blocks(left_func, right_func, level)
+            self._alignment = align_blocks(left_func, right_func, level.level)
             counts: dict[str, int] = {}
             for status in self._alignment.left_status.values():
                 counts[status.value] = counts.get(status.value, 0) + 1
@@ -202,8 +214,8 @@ class GraphDiffTab(QWidget):
         left_graph, left_nodes = build_graph(left_func, level)
         right_graph, right_nodes = build_graph(right_func, level)
 
-        self._color_nodes(left_nodes, self._left_status(left_func, level))
-        self._color_nodes(right_nodes, self._right_status(right_func, level))
+        self._color_nodes(left_nodes, self._left_status(left_func, level.level))
+        self._color_nodes(right_nodes, self._right_status(right_func, level.level))
         self._mark_changed_lines(left_func, right_func, left_nodes, right_nodes)
 
         # Highlights do not change line text, but the core recomputes node

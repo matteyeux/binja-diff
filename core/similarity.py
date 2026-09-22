@@ -46,7 +46,6 @@ from __future__ import annotations
 
 import json
 import traceback
-from typing import NamedTuple
 
 from binaryninja import BinaryView, log_error, log_info, log_warn
 
@@ -397,7 +396,7 @@ def register() -> bool:
             # Not named _render: the base class binds its own _render as the C
             # callback, and shadowing it means the core calls this instead,
             # with the arguments that dispatcher expects.
-            from binaryninja import DisassemblySettings, LinearViewObject
+            from binaryninja import DisassemblySettings
             from binaryninja.similarity import DiffRenderer
 
             match = node.get_result(result)
@@ -433,13 +432,7 @@ def register() -> bool:
                 renderer = DiffRenderer()
                 for annotation in _annotations(rows, side=side):
                     renderer.add_range_annotation(annotation)
-                if level.language:
-                    linear = LinearViewObject.single_function_language_representation(
-                        func, settings, level.language
-                    )
-                else:
-                    _, factory_name = align.IL_LEVELS[level.level]
-                    linear = getattr(LinearViewObject, factory_name)(func, settings)
+                linear = level.linear_object(func, settings)
                 renderer.render_linear_view(context, "Linear", func.view, linear, entity_ref)
 
     class QBinDiffProviderType(SimilarityProviderType):
@@ -484,24 +477,8 @@ def _block_highlight(status):
     )
 
 
-class RenderLevel(NamedTuple):
-    """What the render header is asking for, in the two forms it takes.
-
-    ``level`` is a key of `align.IL_LEVELS`, used to align blocks and grade
-    lines. ``language`` is set only for a language representation — Pseudo C
-    and friends — which is a *rendering* of HLIL rather than a level of its
-    own: the graph and the linear view are built from the language, while the
-    comparison behind them runs on HLIL, whose blocks they share.
-    """
-
-    level: str
-    language: str | None = None
-
-    @property
-    def graph_type(self):
-        """What to hand `create_graph`, which takes either form."""
-
-        return self.language or align.IL_LEVELS[self.level][0]
+#: Kept importable from here; the UI's view selector uses the same type.
+RenderLevel = align.RenderLevel
 
 
 def requested_level(context) -> RenderLevel:
@@ -524,7 +501,7 @@ def requested_level(context) -> RenderLevel:
         return RenderLevel("HLIL", name)
     for level, (graph_type, _factory) in align.IL_LEVELS.items():
         if graph_type == wanted.view_type:
-            return level if isinstance(level, RenderLevel) else RenderLevel(level)
+            return RenderLevel(level)
     return RenderLevel("Disassembly")
 
 
@@ -535,8 +512,8 @@ def _graph_for(func, level: RenderLevel):
 
     # The IL has to exist before a graph of it can be laid out; asking for one
     # that has not been generated yields a single "Loading..." node. A language
-    # representation is rendered from HLIL, so that is what has to exist.
-    align.ensure_il(func, level.level)
+    # representation is rendered from HLIL and generated separately on top.
+    align.ensure_rendering(func, level)
     graph = func.create_graph(graph_type=level.graph_type, settings=DisassemblySettings())
     # Nodes carry no lines until layout has run.
     graph.layout_and_wait()

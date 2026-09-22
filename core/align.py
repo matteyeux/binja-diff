@@ -19,7 +19,7 @@ import difflib
 import re
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 from collections.abc import Iterable, Sequence
 
 import networkx
@@ -82,6 +82,77 @@ IL_LEVELS: dict[str, tuple[FunctionGraphType, str]] = {
     "MLIL": (FunctionGraphType.MediumLevelILFunctionGraph, "single_function_mlil"),
     "HLIL": (FunctionGraphType.HighLevelILFunctionGraph, "single_function_hlil"),
 }
+
+#: Language representations the UI offers, in display order. Each is a rendering
+#: of HLIL rather than a level of its own; only those registered with the core
+#: are shown (see `available_levels`), since they ship as separate plugins.
+LANGUAGES = ("Pseudo C", "Pseudo Objective-C", "Pseudo Rust")
+
+
+class RenderLevel(NamedTuple):
+    """A way of rendering a function, in the two forms it takes.
+
+    ``level`` is a key of `IL_LEVELS`, used to align blocks and grade lines.
+    ``language`` is set only for a language representation — Pseudo C and
+    friends — which is a *rendering* of HLIL rather than a level of its own:
+    the graph and the linear view are built from the language, while the
+    comparison behind them runs on HLIL, whose blocks they share.
+    """
+
+    level: str
+    language: str | None = None
+
+    @property
+    def name(self) -> str:
+        return self.language or self.level
+
+    @property
+    def graph_type(self):
+        """What to hand `create_graph`, which takes either form."""
+
+        return self.language or IL_LEVELS[self.level][0]
+
+    def linear_object(self, func: BNFunction, settings=None):
+        """The single-function `LinearViewObject` for this rendering."""
+
+        from binaryninja import LinearViewObject
+
+        if self.language:
+            return LinearViewObject.single_function_language_representation(
+                func, settings, self.language
+            )
+        _, factory_name = IL_LEVELS[self.level]
+        return getattr(LinearViewObject, factory_name)(func, settings)
+
+
+def render_level(name: str | RenderLevel) -> RenderLevel:
+    """Resolve a display name — an IL level or a language — to a `RenderLevel`."""
+
+    if isinstance(name, RenderLevel):
+        return name
+    if name in IL_LEVELS:
+        return RenderLevel(name)
+    if name in LANGUAGES:
+        return RenderLevel("HLIL", name)
+    raise ValueError(f"Unknown IL level {name!r}")
+
+
+def available_levels() -> list[RenderLevel]:
+    """Every rendering the UI can offer: the IL levels, then registered languages.
+
+    A language whose plugin is not loaded would render nothing, so it is left
+    out rather than offered as a choice that fails.
+    """
+
+    levels = [RenderLevel(level) for level in IL_LEVELS]
+    try:
+        from binaryninja.languagerepresentation import LanguageRepresentationFunctionType
+
+        registered = {language.name for language in LanguageRepresentationFunctionType}
+    except Exception:
+        return levels
+    return levels + [RenderLevel("HLIL", name) for name in LANGUAGES if name in registered]
+
 
 #: Hex literals and addresses shift wholesale between builds, so comparing them
 #: verbatim reports almost every line as changed.
@@ -368,22 +439,37 @@ def ensure_il(func: BNFunction, level: str):
         return None
 
 
-def function_lines(bv: BinaryView, func: BNFunction, level: str) -> list[LinearDisassemblyLine]:
-    """Whole-function rendering at one IL level, in linear-view order.
+def ensure_rendering(func: BNFunction, level: str | RenderLevel) -> None:
+    """`ensure_il`, plus the language representation when one is asked for.
+
+    A language is rendered from HLIL, but it is a separate object with its own
+    lazy generation, and the linear view shows "Loading..." until it exists.
+    """
+
+    level = render_level(level)
+    ensure_il(func, level.level)
+    if level.language:
+        try:
+            func.language_representation(level.language)
+        except Exception:
+            pass
+
+
+def function_lines(
+    bv: BinaryView, func: BNFunction, level: str | RenderLevel
+) -> list[LinearDisassemblyLine]:
+    """Whole-function rendering at one IL level or language, in linear-view order.
 
     The cursor advances in chunks, so a single ``get_next_linear_disassembly_lines``
     call would only return the function header.
     """
 
-    from binaryninja import DisassemblySettings, LinearViewCursor, LinearViewObject
+    from binaryninja import DisassemblySettings, LinearViewCursor
 
-    if level not in IL_LEVELS:
-        raise ValueError(f"Unknown IL level {level!r}")
-    ensure_il(func, level)
-    _, factory_name = IL_LEVELS[level]
-    factory = getattr(LinearViewObject, factory_name)
+    level = render_level(level)
+    ensure_rendering(func, level)
 
-    obj = factory(func, DisassemblySettings())
+    obj = level.linear_object(func, DisassemblySettings())
     cursor = LinearViewCursor(obj)
     cursor.seek_to_begin()
 
@@ -716,9 +802,9 @@ def align_function_text(
     left_func: BNFunction,
     right_bv: BinaryView,
     right_func: BNFunction,
-    level: str,
+    level: str | RenderLevel,
 ) -> list[AlignedRow]:
-    """Full side-by-side alignment of two functions at one IL level."""
+    """Full side-by-side alignment of two functions at one IL level or language."""
 
     left_lines = function_lines(left_bv, left_func, level)
     right_lines = function_lines(right_bv, right_func, level)

@@ -771,6 +771,57 @@ def test_text_similarity_counts_unchanged_lines():
     check("nothing to compare is 1.0", align.text_similarity([]) == 1.0)
 
 
+def test_render_levels():
+    """Every view the UI offers resolves to an IL level to compare on.
+
+    A language is a rendering of HLIL, so its blocks are paired on HLIL and its
+    text is drawn from the language; generating HLIL alone leaves the language's
+    linear view on its "Loading..." placeholder.
+    """
+
+    print("render levels")
+
+    for name in align.IL_LEVELS:
+        level = align.render_level(name)
+        check(f"{name} is its own level", (level.level, level.language) == (name, None))
+        check(f"{name} is named after itself", level.name == name)
+
+    for name in align.LANGUAGES:
+        level = align.render_level(name)
+        check(f"{name} compares on HLIL", (level.level, level.language) == ("HLIL", name))
+        check(f"{name} is drawn as itself", level.graph_type == name and level.name == name)
+
+    check("a level passes through", align.render_level(align.RenderLevel("MLIL")).level == "MLIL")
+    try:
+        align.render_level("Pseudo COBOL")
+        check("an unknown view is refused", False)
+    except ValueError:
+        check("an unknown view is refused", True)
+
+    # The stub registers no languages, which is the case of a core without the
+    # plugins: the IL levels must still all be offered.
+    names = [level.name for level in align.available_levels()]
+    check("IL levels come first", names[: len(align.IL_LEVELS)] == list(align.IL_LEVELS))
+
+    class FakeFunction:
+        def __init__(self):
+            self.touched: list[str] = []
+
+        @property
+        def hlil(self):
+            self.touched.append("hlil")
+
+        def language_representation(self, language):
+            self.touched.append(language)
+
+    func = FakeFunction()
+    align.ensure_rendering(func, "Pseudo Rust")
+    check("a language generates HLIL, then itself", func.touched == ["hlil", "Pseudo Rust"])
+    func = FakeFunction()
+    align.ensure_rendering(func, "HLIL")
+    check("an IL level generates no language", func.touched == ["hlil"], f"{func.touched}")
+
+
 def main() -> int:
     for test in (
         test_empty_inputs,
@@ -783,6 +834,7 @@ def main() -> int:
         test_annotation_only_lines_are_not_instructions,
         test_classification_runs_on_instructions_only,
         test_il_is_generated_before_rendering,
+        test_render_levels,
         test_shape_signature,
         test_side_statuses,
         test_markers,

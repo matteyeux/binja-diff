@@ -44,9 +44,6 @@ from .progresspanel import ProgressPanel
 from .scopedialog import ScopeDialog
 from .textpane import TextDiffTab
 
-#: Text tabs, in display order. The graph tab is added separately.
-_TEXT_LEVELS = ("Disassembly", "LLIL", "MLIL", "HLIL")
-
 #: Stack pages.
 _PAGE_DROP, _PAGE_BUSY, _PAGE_RESULTS = 0, 1, 2
 
@@ -262,13 +259,11 @@ class DiffView(QWidget, View):
         splitter.addWidget(self.table)
 
         self.tabs = QTabWidget(splitter)
+        # One tab per layout; each picks its IL level or language itself.
         self.graph_tab = GraphDiffTab(self.tabs)
-        self.tabs.addTab(self.graph_tab, "Basic Blocks")
-        self.text_tabs: dict[str, TextDiffTab] = {}
-        for level in _TEXT_LEVELS:
-            tab = TextDiffTab(self.tabs, level)
-            self.text_tabs[level] = tab
-            self.tabs.addTab(tab, level)
+        self.tabs.addTab(self.graph_tab, "Graph")
+        self.text_tab = TextDiffTab(self.tabs)
+        self.tabs.addTab(self.text_tab, "Linear")
         self.tabs.currentChanged.connect(lambda _index: self._refresh_current_tab())
         splitter.addWidget(self.tabs)
 
@@ -408,8 +403,7 @@ class DiffView(QWidget, View):
         self.close_button.setEnabled(False)
         self.table.set_result(None)
         self.graph_tab.clear()
-        for tab in self.text_tabs.values():
-            tab.clear()
+        self.text_tab.clear()
 
     def _reset_to_dropzone(self, status: str) -> None:
         self._finish_task()

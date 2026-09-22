@@ -212,8 +212,10 @@ real text in asynchronously. A `TokenizedTextWidget` would repaint when that
 lands; a `QTextEdit` written once does not, so the placeholder is simply what
 the user reads. `align.ensure_il()` reads `func.llil` / `.mlil` / `.hlil` first,
 which forces generation — the `*_if_available` variants deliberately do not.
-This is also why visiting the Basic Blocks tab and coming back used to "fix"
-it: `il_basic_blocks` touches those same properties.
+This is also why visiting the graph tab and coming back used to "fix"
+it: `il_basic_blocks` touches those same properties. A language representation
+is generated separately on top of HLIL, so `ensure_rendering()` also asks for
+`func.language_representation(name)`; use it wherever a `RenderLevel` is drawn.
 
 **`palette(mid)` is unreadable in Binary Ninja's dark themes.** It is Qt's
 answer for muted text, and there `mid` sits a shade off the window color, so
@@ -499,8 +501,16 @@ for the comparison, the language for `create_graph` and
 the pairing is HLIL's while the lines drawn into it are the language's; note
 that at those levels `BasicBlock.start` is an instruction *index*, not an
 address, which is fine because it is only ever used as a key within one
-rendering. `ensure_il()` runs first, since a graph of IL that has not
+rendering. `ensure_rendering()` runs first, since a graph of IL that has not
 been generated is one "Loading..." node.
+
+`RenderLevel` lives in `core/align.py`, not here, because the diff view uses it
+too: its **Graph** and **Linear** tabs each carry one selector over
+`align.available_levels()` — the four IL levels, then whichever of
+`align.LANGUAGES` the core has registered. Languages ship as separate plugins,
+and offering one that is not loaded would render nothing. The graph pane pairs
+blocks on `level.level` and draws `level.graph_type`, exactly as
+`diff_graphs()` does.
 
 **Do not name a helper after one of `SimilarityProvider`'s private callbacks.**
 The base class binds `_visit_node`, `_visit_node_edge`, `_get_name`, `_apply`,

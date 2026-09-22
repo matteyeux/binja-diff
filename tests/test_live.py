@@ -166,7 +166,8 @@ def test_alignment_on_real_functions(result):
             f"{len(blocks.left_status)} vs {len(primary.basic_blocks)}",
         )
 
-        for level in align.IL_LEVELS:
+        # Languages are rendered from HLIL but are a different linear view.
+        for level in [level.name for level in align.available_levels()]:
             rows = align.align_function_text(
                 result.primary_bv, primary, result.secondary_bv, secondary, level
             )
@@ -209,7 +210,8 @@ def test_il_renders_on_the_first_try(result):
         return
 
     primary, secondary = pair
-    for level in ("LLIL", "MLIL", "HLIL"):
+    languages = [level.name for level in align.available_levels() if level.language]
+    for level in ("LLIL", "MLIL", "HLIL", *languages):
         # Deliberately without touching the graph path first: that is what used
         # to generate the IL as a side effect and mask this.
         lines = align.function_lines(result.primary_bv, primary, level)

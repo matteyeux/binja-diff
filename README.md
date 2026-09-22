@@ -4,8 +4,9 @@ A Binary Ninja plugin for side-by-side binary diffing, powered by
 [QBinDiff](https://github.com/quarkslab/qbindiff).
 
 Drop a second binary onto the diff view and the plugin loads it, analyzes it,
-matches its functions against the current binary, and shows the differences at
-five levels: control flow graph, assembly, LLIL, MLIL and HLIL.
+matches its functions against the current binary, and shows the differences
+as a control flow graph or a linear listing, in disassembly, LLIL, MLIL, HLIL,
+Pseudo C, Pseudo Objective-C or Pseudo Rust.
 
 ![Capture](https://matteyeux.com/images/binja-diff2.png)
 
@@ -13,7 +14,8 @@ five levels: control flow graph, assembly, LLIL, MLIL and HLIL.
 
 - No other tools required
 - Supports BNDB import
-- Control flow graph, disassembly, LLIL, MLIL and HLIL diffing views
+- Graph and linear diff views, each in disassembly, LLIL, MLIL, HLIL, Pseudo C,
+  Pseudo Objective-C or Pseudo Rust
 - Save and restore diffs from the BNDB or json file
 - Port function names from one binary to the other
 - Diff a single kext from a kernelcache, or one SEP module

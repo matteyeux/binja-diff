@@ -6,7 +6,7 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 
-"""Side-by-side text diff of two functions at one IL level.
+"""Side-by-side text diff of two functions, at an IL level or language of choice.
 
 Rendering is done here rather than with ``TokenizedTextWidget``. That widget
 has no notion of a per-line background: its only highlight is the
@@ -23,6 +23,7 @@ from binaryninjaui import getMonospaceFont, getTokenColor
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QPalette, QTextCharFormat, QTextCursor
 from PySide6.QtWidgets import (
+    QComboBox,
     QHBoxLayout,
     QLabel,
     QPushButton,
@@ -32,7 +33,14 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..core.align import AlignedRow, LineStatus, align_function_text
+from ..core.align import (
+    AlignedRow,
+    LineStatus,
+    RenderLevel,
+    align_function_text,
+    available_levels,
+    function_lines,
+)
 from . import theme
 
 
@@ -184,11 +192,13 @@ class DiffTextPane(QWidget):
 
 
 class TextDiffTab(QWidget):
-    """A full tab: two panes, synchronized scrolling, one IL level."""
+    """A full tab: two panes, synchronized scrolling, and a view selector."""
 
-    def __init__(self, parent: QWidget, level: str):
+    def __init__(self, parent: QWidget):
         super().__init__(parent)
-        self.level = level
+        self._levels = available_levels()
+        #: The last pair shown, so switching the view can re-render it.
+        self._pair: tuple = (None, None, None, None)
         self._syncing = False
         self._rows: list[AlignedRow] = []
         #: Row indices that differ, for next/previous navigation.
@@ -213,6 +223,13 @@ class TextDiffTab(QWidget):
 
     def _build_header(self) -> QHBoxLayout:
         header = QHBoxLayout()
+
+        header.addWidget(QLabel("View:", self))
+        self.level_combo = QComboBox(self)
+        self.level_combo.addItems([level.name for level in self._levels])
+        self.level_combo.currentIndexChanged.connect(lambda _index: self._reload())
+        header.addWidget(self.level_combo)
+        header.addSpacing(16)
 
         self.summary = QLabel("", self)
         header.addWidget(self.summary)
@@ -307,7 +324,16 @@ class TextDiffTab(QWidget):
             self._syncing = False
         self.position.setText(f"change {self._change_cursor + 1} of {len(self._change_rows)}")
 
+    @property
+    def level(self) -> RenderLevel:
+        return self._levels[max(self.level_combo.currentIndex(), 0)]
+
+    def _reload(self) -> None:
+        if any(func is not None for func in self._pair[1::2]):
+            self.show_pair(*self._pair)
+
     def show_pair(self, left_bv, left_func, right_bv, right_func) -> None:
+        self._pair = (left_bv, left_func, right_bv, right_func)
         if left_func is None or right_func is None:
             self.show_single(left_bv, left_func, right_bv, right_func)
             return
@@ -321,8 +347,6 @@ class TextDiffTab(QWidget):
 
     def show_single(self, left_bv, left_func, right_bv, right_func) -> None:
         """Render an unmatched function on whichever side has it."""
-
-        from ..core.align import function_lines
 
         if left_func is not None:
             lines = function_lines(left_bv, left_func, self.level)
@@ -343,6 +367,7 @@ class TextDiffTab(QWidget):
         self._index_changes()
 
     def clear(self) -> None:
+        self._pair = (None, None, None, None)
         self._rows = []
         self.left.set_title("Primary")
         self.right.set_title("Secondary")
