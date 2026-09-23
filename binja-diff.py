@@ -248,7 +248,12 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--quiet", "-q", action="store_true", help="no progress on stderr")
 
     tuning = parser.add_argument_group("matching")
-    tuning.add_argument("--sparsity", type=float, metavar="F", help="sparsity ratio (default 0.6)")
+    tuning.add_argument(
+        "--sparsity",
+        type=float,
+        metavar="F",
+        help="sparsity ratio (default 0.15, raised for large binaries)",
+    )
     tuning.add_argument("--tradeoff", type=float, metavar="F", help="feature/structure tradeoff")
     tuning.add_argument("--maxiter", type=int, metavar="N", help="belief propagation iterations")
     tuning.add_argument("--distance", metavar="NAME", help="distance function (default haussmann)")

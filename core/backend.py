@@ -21,6 +21,7 @@ from __future__ import annotations
 #: return annotation sitting next to it.
 import builtins
 import weakref
+from collections import defaultdict
 import zlib
 from functools import cached_property
 from typing import TYPE_CHECKING
@@ -35,6 +36,7 @@ from binaryninja.enums import (
     SymbolType,
 )
 
+from qbindiff.features.topology import ImpName
 from qbindiff.loader import Data, Structure
 from qbindiff.loader.backend import (
     AbstractBasicBlockBackend,
@@ -314,6 +316,16 @@ class FunctionBackendBinja(AbstractFunctionBackend):
 
     @cached_property
     def children(self) -> set[Addr]:
+        """Every call target, including ones that are no function of the program.
+
+        Binary Ninja reports its synthetic ``__builtin_memset`` and friends and
+        the GOT slot an import stub jumps through as callees, and a scoped diff
+        has callees outside the part being diffed. Keep them: QBinDiff's call
+        graph drops those edges by itself, and ChildNb counting them measurably
+        helps matching (they are stable across builds). What cannot cope is a
+        feature that looks each child up in the program; see ImportCalls.
+        """
+
         return set(self._func.callee_addresses)
 
     @cached_property
@@ -433,3 +445,20 @@ class ProgramBackendBinja(AbstractProgramBackend):
     @property
     def capabilities(self) -> ProgramCapability:
         return ProgramCapability.INSTR_GROUP
+
+
+class ImportCalls(ImpName):
+    """QBinDiff's ImpName, for callees this backend reports that are not functions.
+
+    ImpName looks every child up in the program and raises KeyError on a call
+    target that is not one of its functions, which this backend reports on
+    purpose (see FunctionBackendBinja.children). Same key, same values, so it
+    is a drop-in replacement.
+    """
+
+    def visit_function(self, program, function, collector) -> None:
+        counts: dict[str, float] = defaultdict(int)
+        for addr in function.children:
+            if addr in program and program[addr].is_import():
+                counts[program[addr].name] += 1
+        collector.add_dict_feature(self.key, counts)

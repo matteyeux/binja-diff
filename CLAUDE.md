@@ -76,7 +76,7 @@ against real Binary Ninja rendering, and the stub encoded what the author
 assumed the tokens looked like rather than what they are.
 
 `test_backend.py`, `test_align.py`, `test_engine.py`, `test_persist.py`,
-`test_symbols.py`, `test_scope.py` and `test_cli.py` install a stub
+`test_symbols.py`, `test_scope.py`, `test_cli.py` and `test_background.py` install a stub
 `binaryninja` module into `sys.modules` and run the **real** QBinDiff against
 it, including a full end-to-end diff with belief propagation. They cover the
 backend's object model, instruction and operand extraction, block and line
@@ -161,6 +161,18 @@ tests possible. Keep engine and alignment logic out of the UI modules.
 do not reliably see `__del__`, so the secondary `BinaryView` is released from a
 `destroyed` handler in `ui/diffview.py`. Only close a `BinaryView` the plugin
 loaded itself; the ones the UI owns must be left alone.
+
+**Stop the background workers before closing that view.** The panes render and
+the match table classifies on worker threads (`ui/background.py`), and those
+threads walk the secondary's functions. Closing a `BinaryView` under one of them
+crashes the process rather than raising. Every path that closes the view
+therefore cancels *and joins* them first: `_release_secondary`, the `destroyed`
+handler (the runners sit in `_owned["workers"]`, plain Python objects, for the
+same reason the view does) and the shutdown hooks via `background.stop_all()`.
+A new worker must be added to that list. What runs on a worker touches Binary
+Ninja and never Qt; anything read from the theme (`getThemeColor` is a UI call)
+is resolved on the UI thread first and passed in, as `graphpane.line_highlights()`
+is.
 
 **Closing that view is what releases the lock on a `.bndb`**, and three things
 have to line up or the user cannot reopen their own database:
@@ -289,6 +301,8 @@ flowchart TD
         dropzone["dropzone.py"]
         progresspanel["progresspanel.py"]
         scopedialog["scopedialog.py"]
+        backgroundMod["background.py: worker threads, no Qt"]
+        levelpicker["levelpicker.py: remembered view choice"]
     end
     backend --> engine
     scopeMod --> engine
@@ -307,6 +321,11 @@ flowchart TD
     diffview --> dropzone
     diffview --> progresspanel
     diffview --> scopedialog
+    backgroundMod --> matchtable
+    backgroundMod --> textpane
+    backgroundMod --> graphpane
+    levelpicker --> textpane
+    levelpicker --> graphpane
 ```
 
 The plugin talks to QBinDiff through `Program.from_backend()`, which accepts an
@@ -315,6 +334,47 @@ change to the vendored `qbindiff/` is needed.
 
 QBinDiff matches functions only. Basic block and line alignment are ours, in
 `core/align.py`, computed lazily for the selected function pair.
+
+### Matching defaults are measured, not guessed
+
+`DiffOptions` and `feature_extractors()` were tuned against symbol ground truth:
+three Lua pairs (a small patch, `-O1` vs `-O2`, and 5.3.6 vs 5.4.3), with
+FuncName and the name anchors disabled so the result is what a stripped diff
+gets. Runs are deterministic, so small differences there are real. Wrong
+matches, patch / compiler / version:
+
+| Setting | Wrong matches |
+| --- | --- |
+| QBinDiff's sparsity 0.6, with `addr` (former defaults) | 2 / 4 / 45 |
+| sparsity 0.15, `imp`, without `addr` (current) | 0 / 3 / 32 |
+
+Only sparsity moved the result. tradeoff, epsilon, `canberra`, StrRef, MDIndex
+and the graph features each changed it by a few matches either way. Things
+that *look* like improvements and are not, all measured:
+
+- **`addr` stays out.** Every numeric feature is compared as
+  `|x - y| / (|x| + |y|)`, so two addresses in one 64-bit image score ~0.9999
+  whatever they are. At 0.6 removing it was a wash; at 0.15 it is the
+  difference between 2/5/39 and 0/3/32.
+- **`children` keeps call targets that are no function.** Binary Ninja reports
+  synthetic `__builtin_*` and `__got` slots as callees. Filtering them out of
+  `children` cost 0/3/32 -> 2/5/38: ChildNb counting them is signal. The one
+  consumer that cannot cope is QBinDiff's ImpName (KeyError on the lookup),
+  which is why `imp` is registered as `backend.ImportCalls`. LibName (`lib`)
+  has the same flaw and is not offered.
+- **QBinDiff's confidence cannot filter matches.** It is ~1.0 for wrong
+  matches too, and every function removed between versions is paired with
+  something.
+- Pinning pairs with identical feature vectors, unmatching on low feature
+  similarity, and re-pairing doubtful matches by `align.text_similarity` were
+  all tried; none helped, and the last made results worse.
+
+The cost of 0.15 is matching time, about 2-2.5x. `scale_options_for_size`
+keeps that bounded with `CANDIDATE_BUDGET`: the number of candidate pairs the
+old 0.6 admitted at 10k x 10k. Below that budget the default applies; past it
+sparsity rises just enough, reaching exactly 0.6 at the threshold, so no diff
+below 10k functions is less accurate or more expensive than before. Above 10k
+the 0.99 row-wise switch is unchanged.
 
 ### A DiffResult holds records, not qbindiff objects
 
@@ -512,6 +572,13 @@ and offering one that is not loaded would render nothing. The graph pane pairs
 blocks on `level.level` and draws `level.graph_type`, exactly as
 `diff_graphs()` does.
 
+The selector is `ui/levelpicker.py`, which stores the choice in `QSettings` by
+*name*, never by index: the languages offered depend on the plugins loaded, so
+an index would point at a different view on the next start. Switching views in
+the Linear tab keeps the reader's place by address (`align.anchor_row`), since
+two renderings share nothing else — and not every address, which is why the
+nearest one is taken when there is no exact match.
+
 **Do not name a helper after one of `SimilarityProvider`'s private callbacks.**
 The base class binds `_visit_node`, `_visit_node_edge`, `_get_name`, `_apply`,
 `_render`, `_free` and the two ref-count hooks as the C callbacks the core
@@ -683,14 +750,21 @@ preserve:
   row read "changed" until it was clicked, and why nothing but clicking fixed
   it. Block text has none of those properties, and it makes `classify_pair`
   testable against the stub.
-- **It is computed lazily, in `data()`, and cached per address pair.** Doing it
-  for every match up front means disassembling both binaries in full before the
-  table can appear. Qt only asks about visible rows, so the cost follows the
-  scrollbar. `MatchTableModel.set_result` clears the cache — porting symbols
-  changes call-site text, and therefore some verdicts.
-- **The Status column still *sorts* on `(kind, -similarity)`.** Sorting asks
-  every row at once, which would classify the whole table on the UI thread and
-  hang exactly as long as the eager version would.
+- **It is cached per address pair and filled from two directions.** A
+  `BatchRunner` classifies every matched pair in the background once a result
+  is set, posting batches back to the UI thread; that is what feeds the summary
+  bar above the table. `data()` still classifies a visible row the pass has not
+  reached, so the rows on screen never wait for it. Doing it all *before*
+  showing the table is what must not come back: that means disassembling both
+  binaries in full first. `MatchTableModel.set_result` cancels the pass and
+  clears the cache — porting symbols changes call-site text, and therefore some
+  verdicts.
+- **Sorting and filtering read the cache only** (`cached_status`), never
+  classify. Both ask about every row at once, which on the UI thread hangs
+  exactly as long as the eager version would. Unclassified rows sort after every
+  verdict, and a status filter grows as batches land. The proxy's
+  `dynamicSortFilter` is off, so a batch never re-sorts rows out from under the
+  reader; `_on_classified` re-applies only a status filter.
 
 `FunctionStatus.UNKNOWN` ("differs") is the escape hatch above
 `MAX_CLASSIFY_INSTRUCTIONS`; keep it, or one enormous function stalls painting.

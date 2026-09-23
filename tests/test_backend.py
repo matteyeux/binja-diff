@@ -80,7 +80,9 @@ def build_view(name: str, *, extra_instruction: bool = False) -> BinaryView:
         [insn("mov", (TT.RegisterToken, "eax", 0), (TT.IntegerToken, "0x7b", 123)), insn("ret")],
     )
     helper = Function(bv, 0x2000, "helper", [helper_block])
-    main.callee_addresses = [0x2000]
+    # 0x9000 is what Binary Ninja reports for a synthetic builtin or a GOT slot:
+    # a call target that is no function of the program.
+    main.callee_addresses = [0x2000, 0x3000, 0x9000]
 
     imported = Function(bv, 0x3000, "printf", [], sym_type=SymbolType.ImportedFunctionSymbol)
 
@@ -113,7 +115,7 @@ def test_backend_shape():
     check("function type normal", main.type == FunctionType.normal)
     check("four basic blocks", len(main) == 4, f"got {len(main)}")
     check("cfg edge count", len(main.flowgraph.edges) == 4, f"got {len(main.flowgraph.edges)}")
-    check("children", main.children == {0x2000}, f"got {main.children}")
+    check("children", main.children == {0x2000, 0x3000, 0x9000}, f"got {main.children}")
 
     helper = program[0x2000]
     check("parents", helper.parents == {0x1000}, f"got {helper.parents}")
@@ -189,6 +191,38 @@ def test_full_diff():
     check("similarity in range", 0.0 <= mapping.normalized_similarity <= 1.0)
 
 
+def test_import_calls_feature():
+    """ImportCalls counts calls to imports and skips targets that are no function.
+
+    QBinDiff's own ImpName raises KeyError on the second kind, which Binary Ninja
+    reports for synthetic builtins and GOT slots.
+    """
+
+    print("import calls feature")
+    from qbindiff.features.extractor import FeatureCollector
+    from qbindiff.features.topology import ImpName
+
+    from binja_diff.core.backend import ImportCalls
+
+    program = Program.from_backend(ProgramBackendBinja(build_view("primary")))
+    main = program[0x1000]
+
+    try:
+        ImpName(1.0).visit_function(program, main, FeatureCollector())
+        check("QBinDiff's ImpName trips on it (else ImportCalls is redundant)", False)
+    except KeyError:
+        check("QBinDiff's ImpName trips on it (else ImportCalls is redundant)", True)
+
+    collector = FeatureCollector()
+    ImportCalls(1.0).visit_function(program, main, collector)
+    check("same key as ImpName", ImportCalls.key == ImpName.key == "imp")
+    check(
+        "the import is counted",
+        dict(collector.get("imp") or {}) == {"printf": 1},
+        f"got {collector.get('imp')}",
+    )
+
+
 def test_instr_group_features():
     print("INSTR_GROUP capability features")
     from qbindiff import QBinDiff
@@ -260,8 +294,8 @@ def test_name_anchor_end_to_end():
     print("name anchors override address order in run_diff")
     from binja_diff.core import engine
 
-    # Identical bodies, names swapped between addresses: features (Address
-    # included) pull toward 0x1000<->0x1000, only the anchor pass knows better.
+    # Identical bodies, names swapped between addresses: the features cannot
+    # tell the two apart, only the anchor pass knows which is which.
     primary_bv = build_named_view("primary", {0x1000: "encrypt", 0x2000: "decrypt"})
     secondary_bv = build_named_view("secondary", {0x1000: "decrypt", 0x2000: "encrypt"})
 
@@ -353,6 +387,7 @@ def main() -> int:
         test_backend_shape,
         test_instruction_level,
         test_full_diff,
+        test_import_calls_feature,
         test_instr_group_features,
         test_name_anchor_pass,
         test_name_anchor_end_to_end,

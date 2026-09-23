@@ -17,7 +17,7 @@ from functools import partial
 
 import binaryninjaui  # must precede PySide6; see ui/__init__
 from binaryninja import execute_on_main_thread, log_error
-from binaryninjaui import UIActionHandler, View, ViewType
+from binaryninjaui import UIActionHandler, View, ViewFrame, ViewType
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QApplication,
@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
 
 from ..core import persist, scope, symbols
 from ..core.engine import DiffOptions, DiffResult, DiffTask, format_duration
+from . import background
 from .dropzone import FILE_FILTER, DropZone, dimmed, local_files
 from .graphpane import GraphDiffTab
 from .matchtable import MatchTable
@@ -75,20 +76,36 @@ def _close_secondary(bv) -> None:
         pass
 
 
+def _stop_workers(workers) -> None:
+    """Cancel background renders and wait for them, before a view is closed.
+
+    They read the secondary view's functions, and closing a view under a thread
+    that is still walking it crashes the process rather than raising.
+    """
+
+    for worker in workers:
+        worker.cancel()
+    for worker in workers:
+        worker.wait()
+
+
 def _release_holder(holder: dict, *_args) -> None:
     """Close whatever a view was holding, given only its holder.
 
     Deliberately takes a plain dict rather than the DiffView: this is what runs
     on ``QWidget.destroyed``, and a bound method of the widget being destroyed
     is exactly what PySide may never call — the Python wrapper is invalidated
-    as the C++ object goes away. Nothing here touches the widget.
+    as the C++ object goes away. Nothing here touches the widget; the workers
+    are plain Python objects, not Qt ones.
     """
 
+    _stop_workers(holder.get("workers", ()))
     _close_secondary(holder.get("bv"))
     holder["bv"] = None
 
 
 def _close_open_secondaries() -> None:
+    background.stop_all()
     for bv in list(_OPEN_SECONDARIES):
         _close_secondary(bv)
     _OPEN_SECONDARIES.clear()
@@ -163,6 +180,11 @@ class DiffView(QWidget, View):
         self.stack.addWidget(self.busy)
         self.stack.addWidget(self._build_results())
         layout.addWidget(self.stack, 1)
+        self._owned["workers"] = [
+            self.graph_tab.renderer,
+            self.text_tab.renderer,
+            self.table.model.classifier,
+        ]
 
     # -- construction ------------------------------------------------------
 
@@ -256,6 +278,7 @@ class DiffView(QWidget, View):
         self.table = MatchTable(splitter)
         self.table.selectionChanged.connect(self._on_row_selected)
         self.table.contextMenuRequested.connect(self._show_match_menu)
+        self.table.rowActivated.connect(self.navigate_to_primary)
         splitter.addWidget(self.table)
 
         self.tabs = QTabWidget(splitter)
@@ -437,6 +460,7 @@ class DiffView(QWidget, View):
         """
 
         if self.secondary_bv is not None and self._owns_secondary:
+            _stop_workers(self._owned.get("workers", ()))
             _close_secondary(self.secondary_bv)
         self._owned["bv"] = None
         self.secondary_bv = None
@@ -462,14 +486,40 @@ class DiffView(QWidget, View):
         self.status.setToolTip("")
         self.stack.setCurrentIndex(_PAGE_DROP)
 
+    def navigate_to_primary(self, row) -> None:
+        """Show a row's primary function in Binary Ninja's own views.
+
+        Only the primary: it is the view this tab belongs to. The secondary is
+        not open in any tab, so there is nothing to navigate to on that side.
+        """
+
+        if row is None or row.primary_addr is None or self.data is None:
+            return
+        frame = ViewFrame.viewFrameForWidget(self)
+        if frame is None:
+            return
+        try:
+            kind = "Graph" if frame.isGraphViewPreferred() else "Linear"
+        except Exception:
+            kind = "Graph"
+        frame.navigate(f"{kind}:{frame.getCurrentDataType()}", row.primary_addr)
+
     def _show_match_menu(self, position) -> None:
-        """Offer to carry the selected names across, in either direction."""
+        """Offer navigation to the current row, and porting names for the selection."""
 
         if self.result is None:
             return
-        rows = [row for row in self.table.selected_rows() if row.is_matched]
         menu = QMenu(self)
         menu.setToolTipsVisible(True)
+
+        current = self._selected_row
+        if current is not None and current.primary_addr is not None:
+            menu.addAction(
+                "Go to primary function", lambda: self.navigate_to_primary(current)
+            ).setToolTip("Leaves the diff; switch back with the view selector")
+            menu.addSeparator()
+
+        rows = [row for row in self.table.selected_rows() if row.is_matched]
         if not rows:
             menu.addAction("No matched function selected").setEnabled(False)
             menu.exec(position)

@@ -822,6 +822,39 @@ def test_render_levels():
     check("an IL level generates no language", func.touched == ["hlil"], f"{func.touched}")
 
 
+def test_anchor_row():
+    """Switching views keeps the reader's place by address.
+
+    Two renderings share no lines, only addresses, and not every address: an
+    HLIL statement covers several instructions. The nearest one has to do.
+    """
+
+    print("anchor row")
+
+    class Line:
+        def __init__(self, address):
+            self.address = address
+
+    class Linear:
+        """A LinearDisassemblyLine: the address is on its contents."""
+
+        def __init__(self, address):
+            self.contents = Line(address)
+
+    rows = [
+        align.AlignedRow(Linear(0x1000), Linear(0x2000), align.LineStatus.EQUAL),
+        align.AlignedRow(Line(0x1010), None, align.LineStatus.REMOVED),
+        align.AlignedRow(None, Line(0x1020), align.LineStatus.ADDED),
+        align.AlignedRow(Line(0x1040), Line(0x1040), align.LineStatus.EQUAL),
+    ]
+    check("an exact address wins", align.anchor_row(rows, 0x1020) == 2)
+    check("either side counts", align.anchor_row(rows, 0x2000) == 0)
+    check("otherwise the nearest", align.anchor_row(rows, 0x1038) == 3)
+    check("no rows, top", align.anchor_row([], 0x1000) == 0)
+    check("reads either line kind", align.line_address(Linear(0x42)) == 0x42)
+    check("a line without one is None", align.line_address(object()) is None)
+
+
 def main() -> int:
     for test in (
         test_empty_inputs,
@@ -835,6 +868,7 @@ def main() -> int:
         test_classification_runs_on_instructions_only,
         test_il_is_generated_before_rendering,
         test_render_levels,
+        test_anchor_row,
         test_shape_signature,
         test_side_statuses,
         test_markers,

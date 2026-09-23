@@ -12,9 +12,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from functools import partial
 
 import binaryninjaui  # noqa: F401  (must precede PySide6)
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, QSortFilterProxyModel, Qt, Signal
+from PySide6.QtCore import (
+    QAbstractTableModel,
+    QModelIndex,
+    QRectF,
+    QSortFilterProxyModel,
+    Qt,
+    Signal,
+)
+from PySide6.QtGui import QColor, QPainter
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
@@ -23,6 +32,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QTableView,
+    QToolTip,
     QVBoxLayout,
     QWidget,
 )
@@ -31,6 +41,7 @@ from ..core import align
 from ..core.align import BlockStatus, FunctionStatus, LineStatus
 from ..core.engine import DiffResult
 from . import theme
+from .background import BatchRunner
 
 
 class RowKind(str, Enum):
@@ -89,6 +100,30 @@ _HEADER_TOOLTIPS = {
 }
 
 
+#: Status column sort order, most interesting first. Rows not classified yet
+#: sort after every verdict, whichever way the column is sorted.
+_STATUS_RANK = {
+    FunctionStatus.CHANGED: 0,
+    FunctionStatus.UNKNOWN: 1,
+    FunctionStatus.MINOR: 2,
+    FunctionStatus.IDENTICAL: 3,
+}
+_UNCLASSIFIED_RANK = len(_STATUS_RANK)
+
+
+def _classify_off_thread(result: DiffResult, key: tuple[int, int]):
+    """(status, line similarity) for one pair, or None. Runs on a worker thread."""
+
+    primary = result.primary_bv.get_function_at(key[0])
+    secondary = result.secondary_bv.get_function_at(key[1])
+    if primary is None or secondary is None:
+        return None
+    status, rows = align.classify_pair(primary, secondary, _LEVEL)
+    if status is None:
+        return None
+    return status, (align.text_similarity(rows) if rows else None)
+
+
 def _status_color(status: FunctionStatus | None):
     """Row tint. Matches the colour the text panes give the same distinction."""
 
@@ -107,15 +142,20 @@ class MatchTableModel(QAbstractTableModel):
         super().__init__(parent)
         self._rows: list[MatchRow] = []
         self._result: DiffResult | None = None
-        #: Function statuses, computed the first time a row is painted and kept
-        #: for as long as the result stands. Classifying every pair up front
-        #: would mean disassembling both binaries in full before showing
-        #: anything; Qt only asks about the rows on screen.
+        #: Function statuses, kept for as long as the result stands. Filled by
+        #: the background pass, and by painting for rows it has not reached:
+        #: classifying every pair *before* showing the table would mean
+        #: disassembling both binaries in full first.
         self._status: dict[tuple[int, int], FunctionStatus] = {}
         #: Per-pair line similarity, filled by the same pass as the status.
         self._same: dict[tuple[int, int], float] = {}
         #: Tooltip text per pair, filled on hover. See explain().
         self._explained: dict[tuple[int, int], str] = {}
+        #: Classifies every matched pair in the background, so the summary and
+        #: the status filter cover the whole table rather than what was painted.
+        self.classifier = BatchRunner("Classifying matched functions")
+        #: Called on the UI thread whenever statuses land, and once when done.
+        self.on_progress = None
 
     def _classify(self, row: MatchRow):
         """(status, line similarity) for a pair, both from one comparison.
@@ -210,11 +250,69 @@ class MatchTableModel(QAbstractTableModel):
         self._explained[key] = text
         return text
 
+    def cached_status(self, row: MatchRow) -> FunctionStatus | None:
+        """The status if it is already known, without computing it.
+
+        What sorting and filtering use: both ask about every row at once, and
+        computing it there would classify the whole table on the UI thread. The
+        background pass fills this in instead.
+        """
+
+        if row.primary_addr is None or row.secondary_addr is None:
+            return None
+        return self._status.get((row.primary_addr, row.secondary_addr))
+
+    def counts(self) -> dict[str, int]:
+        """Rows per summary category; see `SummaryBar.CATEGORIES`."""
+
+        counts = {name: 0 for name, _label, _tint in SummaryBar.CATEGORIES}
+        for row in self._rows:
+            if row.kind is RowKind.PRIMARY_ONLY:
+                counts["primary"] += 1
+            elif row.kind is RowKind.SECONDARY_ONLY:
+                counts["secondary"] += 1
+            else:
+                status = self.cached_status(row)
+                counts[status.value if status is not None else "pending"] += 1
+        return counts
+
+    def _start_classification(self) -> None:
+        result = self._result
+        if result is None:
+            return
+        keys = [
+            (row.primary_addr, row.secondary_addr)
+            for row in self._rows
+            if row.is_matched and row.primary_addr is not None and row.secondary_addr is not None
+        ]
+        if not keys:
+            return
+        self.classifier.start(keys, partial(_classify_off_thread, result), self._absorb)
+
+    def _absorb(self, batch: list, finished: bool) -> None:
+        """Take a batch of verdicts from the background pass. UI thread."""
+
+        for key, value in batch:
+            if value is None:
+                continue
+            status, same = value
+            self._status.setdefault(key, status)
+            if same is not None:
+                self._same.setdefault(key, same)
+        if self._rows:
+            self.dataChanged.emit(
+                self.index(0, 0), self.index(len(self._rows) - 1, len(_COLUMNS) - 1)
+            )
+        if self.on_progress is not None:
+            self.on_progress(finished)
+
     def set_result(self, result: DiffResult | None) -> None:
+        self.classifier.cancel()
         self.beginResetModel()
         self._rows = []
         self._result = result
         self._status.clear()
+        self._same.clear()
         self._explained.clear()
         if result is not None:
             for match in result.matches:
@@ -239,6 +337,7 @@ class MatchTableModel(QAbstractTableModel):
                 )
             self._rows.sort(key=lambda r: (-r.similarity, r.primary_addr or r.secondary_addr or 0))
         self.endResetModel()
+        self._start_classification()
 
     def row_at(self, index: int) -> MatchRow | None:
         if 0 <= index < len(self._rows):
@@ -289,9 +388,10 @@ class MatchTableModel(QAbstractTableModel):
                 return status.value if status is not None else RowKind.MATCHED.value
 
         # Sort on the raw values so numeric columns order correctly. The status
-        # column deliberately sorts on similarity rather than on the classified
-        # status: sorting asks every row at once, and classifying the whole
-        # table on the UI thread is exactly what the laziness avoids.
+        # column sorts on what has been classified already — sorting asks every
+        # row at once, and classifying the whole table on the UI thread is
+        # exactly what the laziness avoids — and the background pass fills in
+        # the rest.
         if role == Qt.UserRole:
             # The Similarity column sorts on whatever has been classified already,
             # falling back to QBinDiff's score for rows nobody has looked at:
@@ -305,7 +405,11 @@ class MatchTableModel(QAbstractTableModel):
                 row.secondary_addr or 0,
                 row.similarity if same is None else same,
                 row.confidence,
-                (row.kind.value, -row.similarity),
+                (
+                    row.kind.value,
+                    _STATUS_RANK.get(self.cached_status(row), _UNCLASSIFIED_RANK),
+                    -row.similarity,
+                ),
             )[column]
 
         if role == Qt.BackgroundRole:
@@ -338,6 +442,10 @@ class _FilterProxy(QSortFilterProxyModel):
         self._status: FunctionStatus | None = None
         self._text = ""
 
+    @property
+    def filters_on_status(self) -> bool:
+        return self._status is not None
+
     def set_filter(self, kind: RowKind | None, status: FunctionStatus | None) -> None:
         self._kind = kind
         self._status = status
@@ -360,13 +468,99 @@ class _FilterProxy(QSortFilterProxyModel):
         if self._status is not None:
             if not row.is_matched:
                 return False
-            if model.status_of(row) != self._status:
+            # Cached only: the background pass is classifying the table, and
+            # rows join the filtered view as their verdicts land.
+            if model.cached_status(row) != self._status:
                 return False
         if self._text:
             haystack = f"{row.primary_name} {row.secondary_name}".lower()
             if self._text not in haystack:
                 return False
         return True
+
+
+class SummaryBar(QWidget):
+    """The whole diff in one bar: how many functions fall in each category.
+
+    Filled in as the background pass classifies, with the unclassified rest
+    shown as a neutral segment. Clicking a segment filters the table to it.
+    """
+
+    #: (key, label, reference tint). Keys are `FunctionStatus` values where
+    #: there is one, so `MatchTableModel.counts` can index by status.
+    CATEGORIES = (
+        (FunctionStatus.CHANGED.value, "changed", theme.status_tint(LineStatus.CHANGED)),
+        (FunctionStatus.MINOR.value, "offsets only", theme.status_tint(LineStatus.MINOR)),
+        (FunctionStatus.IDENTICAL.value, "identical", QColor(70, 190, 90)),
+        (FunctionStatus.UNKNOWN.value, "too large to classify", QColor(150, 150, 150)),
+        ("primary", "only in primary", theme.status_tint(LineStatus.REMOVED)),
+        ("secondary", "only in secondary", theme.status_tint(LineStatus.ADDED)),
+        ("pending", "not classified yet", None),
+    )
+
+    HEIGHT = 10
+
+    #: Emitted with a category key when its segment is clicked.
+    categoryClicked = Signal(str)
+
+    def __init__(self, parent: QWidget):
+        super().__init__(parent)
+        self.setFixedHeight(self.HEIGHT)
+        self.setMouseTracking(True)
+        self.setCursor(Qt.PointingHandCursor)
+        self._counts: dict[str, int] = {}
+        self._colors = {
+            key: theme.solid(tint) if tint is not None else theme.background()
+            for key, _label, tint in self.CATEGORIES
+        }
+
+    def set_counts(self, counts: dict[str, int]) -> None:
+        self._counts = counts
+        self.update()
+
+    def _segments(self) -> list[tuple[str, float, float]]:
+        total = sum(self._counts.values())
+        if not total:
+            return []
+        segments, x = [], 0.0
+        for key, _label, _tint in self.CATEGORIES:
+            count = self._counts.get(key, 0)
+            if count:
+                width = count / total * self.width()
+                segments.append((key, x, width))
+                x += width
+        return segments
+
+    def _segment_at(self, x: float) -> str | None:
+        for key, start, width in self._segments():
+            if start <= x < start + width:
+                return key
+        return None
+
+    def paintEvent(self, _event) -> None:
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), theme.background())
+        for key, start, width in self._segments():
+            painter.fillRect(QRectF(start, 0, max(width, 1.0), self.height()), self._colors[key])
+
+    def mouseMoveEvent(self, event) -> None:
+        key = self._segment_at(event.position().x())
+        labels = {k: label for k, label, _tint in self.CATEGORIES}
+        if key is None:
+            QToolTip.hideText()
+            return
+        total = sum(self._counts.values())
+        count = self._counts.get(key, 0)
+        QToolTip.showText(
+            event.globalPosition().toPoint(),
+            f"{count} {labels[key]} ({count / total * 100:.1f}%)",
+            self,
+        )
+
+    def mousePressEvent(self, event) -> None:
+        key = self._segment_at(event.position().x())
+        if key is not None:
+            self.categoryClicked.emit(key)
 
 
 class MatchTable(QWidget):
@@ -377,6 +571,8 @@ class MatchTable(QWidget):
     #: applies to come from selected_rows(); what may be done with them depends
     #: on the two views, which the diff view owns rather than this widget.
     contextMenuRequested = Signal(object)
+    #: Double-click, with the row. What "open" means is the diff view's call.
+    rowActivated = Signal(object)
 
     def __init__(self, parent: QWidget):
         super().__init__(parent)
@@ -409,8 +605,21 @@ class MatchTable(QWidget):
         controls.addWidget(self.stats)
         layout.addLayout(controls)
 
+        summary = QHBoxLayout()
+        self.summary_bar = SummaryBar(self)
+        self.summary_bar.categoryClicked.connect(self._filter_to_category)
+        summary.addWidget(self.summary_bar, 1)
+        self.summary_text = QLabel("", self)
+        summary.addWidget(self.summary_text)
+        layout.addLayout(summary)
+
         self.model = MatchTableModel(self)
+        self.model.on_progress = self._on_classified
         self.proxy = _FilterProxy(self)
+        # Statuses land in batches while the reader is looking at the table; a
+        # proxy re-sorting on every batch would pull rows out from under them.
+        # Filters are re-applied explicitly in _on_classified instead.
+        self.proxy.setDynamicSortFilter(False)
         self.proxy.setSourceModel(self.model)
 
         self.table = QTableView(self)
@@ -432,14 +641,14 @@ class MatchTable(QWidget):
         header.setStretchLastSection(True)
         header.setSectionResizeMode(QHeaderView.Interactive)
         self.table.selectionModel().selectionChanged.connect(self._emit_selection)
+        self.table.doubleClicked.connect(self._emit_activated)
         layout.addWidget(self.table, 1)
 
     def _apply_filter(self, index: int) -> None:
         """Split the chosen entry into a pairing filter and a status filter.
 
-        Filtering by status classifies every row it is asked about, so picking
-        one costs a pass over the table — unavoidable, since a status is a
-        property of the code rather than of the match.
+        A status filter shows what the background pass has classified so far,
+        and grows as it goes; see _on_classified.
         """
 
         selected = self.filter_combo.itemData(index)
@@ -451,6 +660,42 @@ class MatchTable(QWidget):
             elif group == "status":
                 status = FunctionStatus(value)
         self.proxy.set_filter(kind, status)
+
+    def _filter_to_category(self, key: str) -> None:
+        """Point the Show: combo at a summary-bar segment."""
+
+        wanted = {
+            "primary": f"kind:{RowKind.PRIMARY_ONLY.value}",
+            "secondary": f"kind:{RowKind.SECONDARY_ONLY.value}",
+            FunctionStatus.IDENTICAL.value: f"status:{FunctionStatus.IDENTICAL.value}",
+            FunctionStatus.MINOR.value: f"status:{FunctionStatus.MINOR.value}",
+            FunctionStatus.CHANGED.value: f"status:{FunctionStatus.CHANGED.value}",
+        }.get(key)
+        if wanted is None:
+            return
+        index = self.filter_combo.findData(wanted)
+        if index >= 0:
+            self.filter_combo.setCurrentIndex(index)
+
+    def _on_classified(self, finished: bool) -> None:
+        counts = self.model.counts()
+        self.summary_bar.set_counts(counts)
+        classified = sum(counts.values()) - counts["primary"] - counts["secondary"]
+        pending = counts["pending"]
+        parts = [
+            f"{counts[FunctionStatus.CHANGED.value]} changed",
+            f"{counts[FunctionStatus.MINOR.value]} offsets only",
+            f"{counts[FunctionStatus.IDENTICAL.value]} identical",
+        ]
+        if pending and not finished:
+            parts.append(f"classifying {classified - pending}/{classified}")
+        self.summary_text.setText("   ".join(parts))
+        if self.proxy.filters_on_status:
+            self.proxy.invalidateFilter()
+
+    def _emit_activated(self, index) -> None:
+        if index.isValid():
+            self.rowActivated.emit(self.model.row_at(self.proxy.mapToSource(index).row()))
 
     def _emit_selection(self, *_args) -> None:
         # The panes show one pair, so they follow the current row: with several
@@ -490,8 +735,10 @@ class MatchTable(QWidget):
 
     def set_result(self, result: DiffResult | None) -> None:
         self.model.set_result(result)
+        self._on_classified(False)
         if result is None:
             self.stats.setText("")
+            self.summary_text.setText("")
             return
         self.stats.setText(
             f"{result.nb_match} matched   "

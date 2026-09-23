@@ -88,8 +88,8 @@ _SETTINGS: tuple[tuple[str, dict], ...] = (
             "maxValue": 1.0,
             "description": (
                 "Share of the least likely candidate pairs discarded before matching. "
-                "A memory and speed control rather than a quality one; it is raised "
-                "automatically for large programs."
+                "Lower is more accurate and slower; it is raised automatically as far "
+                "as a program's size requires."
             ),
         },
     ),

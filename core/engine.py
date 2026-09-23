@@ -41,10 +41,22 @@ if TYPE_CHECKING:
 #: Structural feature keys registered on top of QBinDiff's own defaults.
 #: The stock defaults (FuncName, Address, DatName, Constant) carry almost no
 #: signal on a stripped binary at a different base address: names are gone,
-#: addresses moved, and only data references and constants remain. These six
+#: addresses moved, and only data references and constants remain. These
 #: describe the code itself — mnemonic histograms, CFG size and complexity,
-#: call-graph fan-in/out — and are cheap to extract.
-DEFAULT_EXTRA_FEATURES = ("M", "Mt", "bnb", "cc", "cnb", "pnb")
+#: call-graph fan-in/out, and which imports a function calls — and are cheap to
+#: extract. `imp` is registered as backend.ImportCalls rather than QBinDiff's
+#: ImpName, which is not in its FEATURES table and crashes on the call targets
+#: this backend reports that are not functions.
+DEFAULT_EXTRA_FEATURES = ("M", "Mt", "bnb", "cc", "cnb", "pnb", "imp")
+
+#: QBinDiff defaults that run_diff leaves out. `addr` compares function
+#: addresses with the same ratio as every numeric feature, |x - y| / (|x| + |y|),
+#: and two addresses in one 64-bit image score ~0.9999 whatever they are: a
+#: near-constant that only flattens the numeric features it is pooled with.
+#: Measured on Lua builds with symbol ground truth, dropping it at sparsity 0.15
+#: took wrong matches from 2/5/39 to 0/3/32 (patch / -O1 vs -O2 / 5.3 vs 5.4).
+#: Still available as an explicit extra feature.
+EXCLUDED_DEFAULT_FEATURES = ("addr",)
 
 #: Feature keys offered in the UI beyond what run_diff registers by default.
 #: spp and Gmd largely repeat what M and bnb/cc already measure, so they stay
@@ -199,7 +211,12 @@ class DiffOptions:
     so the two front ends cannot drift apart.
     """
 
-    sparsity_ratio: float = 0.6
+    sparsity_ratio: float = 0.15
+    """Share of the least likely candidate pairs discarded before matching.
+    Lower is more accurate and slower. 0.15 against QBinDiff's own 0.6 cut the
+    wrong matches on a real version upgrade (Lua 5.3 -> 5.4) from 45 to 32 of
+    ~530, at about twice the matching time; going lower gained nothing. Raised
+    for large programs, see scale_options_for_size."""
     tradeoff: float = 0.8
     epsilon: float = 0.9
     maxiter: int = 1000
@@ -222,11 +239,23 @@ class DiffOptions:
 LARGE_DIFF_FUNCTIONS = 10_000
 LARGE_DIFF_SPARSITY = 0.99
 
+#: Candidate pairs belief propagation may keep below LARGE_DIFF_FUNCTIONS: what
+#: the former fixed sparsity of 0.6 already admitted at that threshold. Matching
+#: memory and time follow the candidate count, so holding to it means the lower
+#: default never makes a diff more expensive than the old worst case — and
+#: never less accurate than before, since the ratio it implies only reaches 0.6
+#: at the threshold itself.
+CANDIDATE_BUDGET = round((1 - 0.6) * LARGE_DIFF_FUNCTIONS**2)
+
 
 def scale_options_for_size(
     options: DiffOptions, primary_count: int, secondary_count: int
 ) -> DiffOptions:
     """Adapt the matching parameters to the size of the programs.
+
+    Below LARGE_DIFF_FUNCTIONS, sparsity is raised only as far as it takes to
+    keep the candidate pairs within CANDIDATE_BUDGET, which leaves the default
+    alone up to roughly 6900 x 6900 functions.
 
     Above LARGE_DIFF_FUNCTIONS on either side, sparsity is raised to
     LARGE_DIFF_SPARSITY and row-wise sparsification is enabled, following
@@ -238,8 +267,20 @@ def scale_options_for_size(
     """
 
     largest = max(primary_count, secondary_count)
-    if not options.auto_sparsity or largest <= LARGE_DIFF_FUNCTIONS:
+    if not options.auto_sparsity:
         return options
+    if largest <= LARGE_DIFF_FUNCTIONS:
+        pairs = primary_count * secondary_count
+        needed = 1 - CANDIDATE_BUDGET / pairs if pairs else 0.0
+        if needed <= options.sparsity_ratio:
+            return options
+        needed = round(needed, 3)
+        log_info(
+            f"{primary_count} x {secondary_count} functions: raising sparsity "
+            f"{options.sparsity_ratio} -> {needed} to bound matching cost",
+            "QBinDiff",
+        )
+        return replace(options, sparsity_ratio=needed)
     dense_gib = primary_count * secondary_count * 4 / 1024**3
     if options.sparsity_ratio >= LARGE_DIFF_SPARSITY:
         log_warn(
@@ -559,6 +600,29 @@ def build_program(bv: BinaryView, region=None):
     return Program.from_backend(ProgramBackendBinja(bv, functions_in(bv, region)))
 
 
+def feature_extractors(extra: Iterable[str] = ()) -> list:
+    """The feature extractor classes a diff registers, in registration order.
+
+    QBinDiff's defaults minus EXCLUDED_DEFAULT_FEATURES, then
+    DEFAULT_EXTRA_FEATURES, then ``extra``. Unknown keys are logged and skipped.
+    """
+
+    from qbindiff.features import DEFAULT_FEATURES, FEATURES
+
+    from .backend import ImportCalls
+
+    extractors = {f.key: f for f in FEATURES}
+    extractors[ImportCalls.key] = ImportCalls
+    selected = [f for f in DEFAULT_FEATURES if f.key not in EXCLUDED_DEFAULT_FEATURES]
+    for key in (*DEFAULT_EXTRA_FEATURES, *extra):
+        extractor = extractors.get(key)
+        if extractor is None:
+            log_warn(f"Unknown feature '{key}' ignored", "QBinDiff")
+        elif extractor not in selected:
+            selected.append(extractor)
+    return selected
+
+
 def run_diff(
     primary_bv: BinaryView,
     secondary_bv: BinaryView,
@@ -577,7 +641,6 @@ def run_diff(
     import numpy
 
     from qbindiff import Distance, QBinDiff
-    from qbindiff.features import DEFAULT_FEATURES, FEATURES
 
     options = options or DiffOptions()
     is_cancelled = cancelled or (lambda: False)
@@ -673,14 +736,7 @@ def run_diff(
         )
         differ.register_postpass(match_named_functions)
 
-        extractors = {f.key: f for f in FEATURES}
-        selected = list(DEFAULT_FEATURES)
-        for key in (*DEFAULT_EXTRA_FEATURES, *options.features):
-            extractor = extractors.get(key)
-            if extractor is None:
-                log_warn(f"Unknown feature '{key}' ignored", "QBinDiff")
-            elif extractor not in selected:
-                selected.append(extractor)
+        selected = feature_extractors(options.features)
         for extractor in selected:
             differ.register_feature_extractor(extractor, 1.0)
 

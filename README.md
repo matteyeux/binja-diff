@@ -17,6 +17,10 @@ Pseudo C, Pseudo Objective-C or Pseudo Rust.
 - Graph and linear diff views, each in disassembly, LLIL, MLIL, HLIL, Pseudo C,
   Pseudo Objective-C or Pseudo Rust
 - Save and restore diffs from the BNDB or json file
+- Whole-diff summary, filled in the background: changed, offsets only, identical,
+  unmatched — click a segment to filter
+- Overview strip beside the linear diff marking where the changes are
+- Double-click a match to jump to it in the primary binary
 - Port function names from one binary to the other
 - Diff a single kext from a kernelcache, or one SEP module
 - QBinDiff as a provider for Binary Similarity sessions

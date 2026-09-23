@@ -251,29 +251,74 @@ def test_load_missing_file():
 
 
 def test_sparsity_scaling():
-    print("sparsity scaling for large binaries")
+    print("sparsity scaling by size")
     options = engine.DiffOptions()
+    default = options.sparsity_ratio
 
-    small = engine.scale_options_for_size(options, 5_000, 8_000)
-    check("small diff untouched", small.sparsity_ratio == 0.6 and not small.sparse_row)
+    small = engine.scale_options_for_size(options, 2_500, 2_500)
+    check("small diff untouched", small.sparsity_ratio == default and not small.sparse_row)
 
+    # 5000 x 8000 is exactly the candidate budget: still within it.
+    budget = engine.scale_options_for_size(options, 5_000, 8_000)
+    check("within the budget, untouched", budget.sparsity_ratio == default)
+
+    medium = engine.scale_options_for_size(options, 8_000, 9_000)
+    kept = (1 - medium.sparsity_ratio) * 8_000 * 9_000
+    check(
+        "past the budget, raised just enough",
+        default < medium.sparsity_ratio < 0.6 and kept <= engine.CANDIDATE_BUDGET * 1.001,
+        f"{medium.sparsity_ratio}, {kept:.0f} pairs",
+    )
+    check("medium stays global", not medium.sparse_row)
+
+    # The budget is what 0.6 admitted at the threshold, so a diff below it is
+    # never sparser -- never less accurate -- than it was with that default.
     boundary = engine.scale_options_for_size(options, 10_000, 10_000)
-    check("threshold is exclusive", boundary.sparsity_ratio == 0.6)
+    check("the threshold lands on the old default", boundary.sparsity_ratio == 0.6)
 
     large = engine.scale_options_for_size(options, 50_000, 60_000)
     check("sparsity raised", large.sparsity_ratio == engine.LARGE_DIFF_SPARSITY)
     check("row-wise sparsification enabled", large.sparse_row)
-    check("caller's options not mutated", options.sparsity_ratio == 0.6 and not options.sparse_row)
+    check(
+        "caller's options not mutated",
+        options.sparsity_ratio == default and not options.sparse_row,
+    )
 
     explicit = engine.scale_options_for_size(
         engine.DiffOptions(sparsity_ratio=0.995), 50_000, 60_000
     )
     check("explicit higher sparsity respected", explicit.sparsity_ratio == 0.995)
+    explicit = engine.scale_options_for_size(engine.DiffOptions(sparsity_ratio=0.9), 8_000, 9_000)
+    check("explicit sparsity above the budget kept", explicit.sparsity_ratio == 0.9)
 
-    disabled = engine.scale_options_for_size(
-        engine.DiffOptions(auto_sparsity=False), 50_000, 60_000
+    for count in (50_000, 9_000):
+        disabled = engine.scale_options_for_size(
+            engine.DiffOptions(auto_sparsity=False), count, count
+        )
+        check(
+            f"opt-out respected at {count}",
+            disabled.sparsity_ratio == default and not disabled.sparse_row,
+        )
+
+
+def test_feature_selection():
+    print("feature selection")
+    keys = [f.key for f in engine.feature_extractors()]
+    check("Address left out by default", "addr" not in keys, f"{keys}")
+    check("import calls registered", "imp" in keys, f"{keys}")
+    check("the other QBinDiff defaults kept", {"fname", "dat", "cst"} <= set(keys), f"{keys}")
+    check("structural extras kept", set(engine.DEFAULT_EXTRA_FEATURES) <= set(keys))
+    check("no feature twice", len(keys) == len(set(keys)), f"{keys}")
+
+    from binja_diff.core.backend import ImportCalls
+
+    check(
+        "imp is the guarded ImportCalls, not QBinDiff's ImpName",
+        ImportCalls in engine.feature_extractors(),
     )
-    check("opt-out respected", disabled.sparsity_ratio == 0.6 and not disabled.sparse_row)
+    keys = [f.key for f in engine.feature_extractors(("addr", "nonsense"))]
+    check("Address can still be asked for", "addr" in keys, f"{keys}")
+    check("an unknown key is skipped", "nonsense" not in keys)
 
 
 def test_result_indexing():
@@ -443,6 +488,7 @@ def main() -> int:
         test_database_detection,
         test_load_missing_file,
         test_sparsity_scaling,
+        test_feature_selection,
         test_result_indexing,
         test_wait_for_analysis,
         test_log_bridge,

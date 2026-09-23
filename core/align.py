@@ -811,6 +811,37 @@ def align_function_text(
     return align_lines(left_lines, right_lines)
 
 
+def line_address(line) -> int | None:
+    """The address a rendered line stands for, from either kind of line object."""
+
+    contents = getattr(line, "contents", None)
+    address = getattr(contents if contents is not None else line, "address", None)
+    return address if isinstance(address, int) else None
+
+
+def anchor_row(rows: Sequence[AlignedRow], address: int) -> int:
+    """The row to scroll to so that ``address`` stays where the reader left it.
+
+    Switching the view keeps the place by address, since two renderings share
+    nothing else — and not every rendering has every address: one HLIL
+    statement stands for several instructions. So an exact match wins, and
+    otherwise the row whose address is nearest.
+    """
+
+    best, best_distance = 0, None
+    for index, row in enumerate(rows):
+        for line in (row.left, row.right):
+            candidate = line_address(line) if line is not None else None
+            if candidate is None:
+                continue
+            distance = abs(candidate - address)
+            if distance == 0:
+                return index
+            if best_distance is None or distance < best_distance:
+                best, best_distance = index, distance
+    return best
+
+
 class FunctionStatus(str, Enum):
     """How a matched pair compares, as a whole.
 

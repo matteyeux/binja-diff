@@ -20,6 +20,7 @@ TESTS = (
     "test_scope.py",
     "test_cli.py",
     "test_similarity.py",
+    "test_background.py",
 )
 
 #: Needs a real Binary Ninja; skips itself cleanly when unavailable.

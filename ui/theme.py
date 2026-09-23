@@ -113,6 +113,33 @@ def line_color(status: LineStatus) -> QColor | None:
     return _blend(background(), tint, _STRENGTH[status])
 
 
+#: How far a mark's tint is pushed over the background. Row tints are pale
+#: because they sit behind text; a two-pixel mark on the overview strip or a
+#: segment of the summary bar carries no text and has to read on its own.
+_SOLID_STRENGTH = 0.75
+
+
+def solid(tint: QColor) -> QColor:
+    """A tint strong enough to stand alone, as a mark rather than a background."""
+
+    return _blend(background(), tint, _SOLID_STRENGTH)
+
+
+def marker_color(status: LineStatus) -> QColor | None:
+    """Overview-strip mark for a line status, or ``None`` for one not worth marking."""
+
+    tint = _TINTS.get(status)
+    if tint is None or status is LineStatus.GAP:
+        return None
+    return solid(tint)
+
+
+def status_tint(status: LineStatus) -> QColor | None:
+    """The saturated reference tint for a status, before any blending."""
+
+    return _TINTS.get(status)
+
+
 #: Graph nodes have no room for the gutter markers the text panes use, so color
 #: is the only signal there. Splitting modified instructions into two colors just
 #: asks the reader to decode a distinction they cannot see the key for, so an
