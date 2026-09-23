@@ -307,6 +307,20 @@ def test_shape_signature():
     )
     check("register swap is MINOR", rows[0].status is align.LineStatus.MINOR, f"{rows[0].status}")
 
+    # A system/CSR register names architectural state, not compiler allocation.
+    rows = align.align_lines(
+        [instr("msr", reg("apdbkeylo_el2"), reg("x1"))],
+        [instr("msr", reg("apibkeylo_el1"), reg("x1"))],
+    )
+    check("different system registers are CHANGED", rows[0].status is align.LineStatus.CHANGED)
+    rows = align.align_lines(
+        [instr("mrs", reg("x0"), reg("sctlr_el1"))],
+        [instr("mrs", reg("x0"), reg("sctlr_el2"))],
+    )
+    check("different control registers are CHANGED", rows[0].status is align.LineStatus.CHANGED)
+    check("weak matching and weak code evidence need review", align.pairing_needs_review(0.0, 0.2))
+    check("substantial shared code avoids review", not align.pairing_needs_review(0.0, 0.6))
+
     # Same operation, different immediate.
     rows = align.align_lines(
         [instr("cmp", reg("eax"), num("0x64"))],
@@ -743,6 +757,7 @@ def test_classification_runs_on_instructions_only():
     huge = func_with_blocks("big", {0x10: ["nop"] * (align.MAX_CLASSIFY_INSTRUCTIONS + 1)})
     status, _rows = align.classify_pair(huge, huge)
     check("an enormous pair is left unknown", status is align.FunctionStatus.UNKNOWN, f"{status}")
+    check("unknown does not claim a difference", status.value == "unclassified", status.value)
 
 
 def test_text_similarity_counts_unchanged_lines():
@@ -855,6 +870,32 @@ def test_anchor_row():
     check("a line without one is None", align.line_address(object()) is None)
 
 
+def test_repeated_edit_pattern():
+    """Repetitions are visible without folding distinct literal changes."""
+
+    print("repeated edit pattern")
+    base = ["push x29", "mov x0, x1", "ret"]
+    inserted = ["push x29", "mov x0, x1", "mov w5, #0x2", "bl 0x1000", "ret"]
+    first = align.edit_pattern(align.align_lines(base, inserted))
+    check("an insertion has a pattern", first is not None)
+    check("the same edit repeats", first == align.edit_pattern(align.align_lines(base, inserted)))
+    different_target = inserted.copy()
+    different_target[3] = "bl 0x2000"
+    check(
+        "distinct call targets remain distinct",
+        first != align.edit_pattern(align.align_lines(base, different_target)),
+    )
+    different_position = ["mov w5, #0x2", "bl 0x1000", *base]
+    check(
+        "the location in the function matters",
+        first != align.edit_pattern(align.align_lines(base, different_position)),
+    )
+    check(
+        "operand-only churn has no edit pattern",
+        align.edit_pattern(align.align_lines(["bl 0x1000"], ["bl 0x2000"])) is None,
+    )
+
+
 def main() -> int:
     for test in (
         test_empty_inputs,
@@ -869,6 +910,7 @@ def main() -> int:
         test_il_is_generated_before_rendering,
         test_render_levels,
         test_anchor_row,
+        test_repeated_edit_pattern,
         test_shape_signature,
         test_side_statuses,
         test_markers,

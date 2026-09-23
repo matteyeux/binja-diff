@@ -15,12 +15,16 @@ thread by the caller.
 
 from __future__ import annotations
 
+import bisect
+import difflib
+import hashlib
 import logging
 import re
 import time
 import traceback
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING
 from collections.abc import Callable
@@ -108,37 +112,237 @@ def match_named_functions(
     secondary_mapping: dict[Addr, Idx],
     primary_features: dict | None = None,
     secondary_features: dict | None = None,
+    *,
+    primary_bv: BinaryView,
+    secondary_bv: BinaryView,
+    exact_pairs: set[tuple[int, int]] | None = None,
 ) -> None:
-    """Postpass anchoring functions that carry the same real symbol name.
+    """Anchor unique, byte-identical code and cautiously use matching names.
 
-    QBinDiff only anchors imports on its own; two non-import functions with
-    identical names merely share one feature vote among many. A symbol name —
-    from an unstripped binary, or a .bndb where the user renamed functions —
-    is stronger evidence than any feature, so pin those pairs outright and let
-    belief propagation spend its effort on the functions actually in doubt.
+    The exact-code anchors rescue repeated small helpers whose generic graph
+    features are indistinguishable. Same-address exact code is pinned first;
+    code moved across addresses is pinned only when unique on both sides, so a
+    ubiquitous return stub cannot force an arbitrary pair. Names are weaker:
+    user annotations can refer to different code in two databases. A name is
+    only pinned when the functions also have comparable size and line content.
 
-    Deliberately a postpass, not a prepass. A prepass makes FeaturePass skip
-    the anchored rows, and when every function pair anchors — two fully
-    symboled builds of the same source — FeaturePass divides by the count of
-    rows it has left, which is zero (qbindiff 1.2.3, passes/base.py). It also
-    crashes before resetting the function filters it installed, so the error
-    is not recoverable from outside. Overwriting the computed similarities
-    afterwards costs one redundant feature extraction and has no edge cases.
+    This runs after feature extraction. QBinDiff's prepass can divide by zero
+    when every function is anchored, while its postpass has no such problem.
     """
 
-    secondary_names = _anchor_names(secondary)
-    pairs = [
-        (primary_mapping[addr], secondary_mapping[secondary_names[name]])
-        for name, addr in _anchor_names(primary).items()
-        if name in secondary_names
+    from functools import lru_cache
+
+    from . import align
+
+    def code_signatures(bv: BinaryView, program: QBProgram) -> dict[int, tuple[str, bytes]]:
+        signatures: dict[int, tuple[str, bytes]] = {}
+        for addr, _ in program.items():
+            func = bv.get_function_at(addr)
+            if func is None:
+                continue
+            blocks = sorted(func.basic_blocks, key=lambda block: block.start)
+            if not blocks or sum(block.length for block in blocks) < 8:
+                continue
+            chunks = [bv.read(block.start, block.length) for block in blocks]
+            if any(
+                chunk is None or len(chunk) != block.length
+                for chunk, block in zip(chunks, blocks, strict=True)
+            ):
+                continue
+            code = b"".join(chunks)
+            arch = getattr(func, "arch", bv.arch)
+            key = (getattr(arch, "name", ""), hashlib.sha256(code).digest())
+            signatures[addr] = key
+        return signatures
+
+    def unique_code(
+        signatures: dict[int, tuple[str, bytes]], excluded: set[int]
+    ) -> dict[tuple[str, bytes], int]:
+        found: dict[tuple[str, bytes], int] = {}
+        duplicates: set[tuple[str, bytes]] = set()
+        for addr, key in signatures.items():
+            if addr in excluded:
+                continue
+            if key in found:
+                duplicates.add(key)
+            else:
+                found[key] = addr
+        for key in duplicates:
+            del found[key]
+        return found
+
+    def pin(pairs: list[tuple[int, int]]) -> None:
+        if not pairs:
+            return
+        rows, cols = zip(*pairs, strict=True)
+        sim_matrix[rows, :] = 0
+        sim_matrix[:, cols] = 0
+        sim_matrix[rows, cols] = 1
+
+    left_signatures = code_signatures(primary_bv, primary)
+    right_signatures = code_signatures(secondary_bv, secondary)
+    same_addrs: set[int] = set()
+    for addr, key in left_signatures.items():
+        if right_signatures.get(addr) != key:
+            continue
+        left_name, right_name = primary[addr].name, secondary[addr].name
+        if left_name != right_name and not (
+            is_generated_name(left_name) or is_generated_name(right_name)
+        ):
+            continue
+        same_addrs.add(addr)
+    left_code = unique_code(left_signatures, same_addrs)
+    right_code = unique_code(right_signatures, same_addrs)
+    exact = [(primary_mapping[addr], secondary_mapping[addr]) for addr in same_addrs] + [
+        (primary_mapping[left_addr], secondary_mapping[right_code[key]])
+        for key, left_addr in left_code.items()
+        if key in right_code
     ]
-    if not pairs:
+    pin(exact)
+    if exact_pairs is not None:
+        exact_pairs.update((addr, addr) for addr in same_addrs)
+        exact_pairs.update(
+            (left_addr, right_code[key])
+            for key, left_addr in left_code.items()
+            if key in right_code
+        )
+    used_left = {pair[0] for pair in exact}
+    used_right = {pair[1] for pair in exact}
+
+    @lru_cache(maxsize=512)
+    def lines(bv_side: int, addr: int):
+        bv = primary_bv if bv_side == 0 else secondary_bv
+        func = bv.get_function_at(addr)
+        if func is None:
+            return []
+        return align.function_instruction_lines(func, "Disassembly")
+
+    @lru_cache(maxsize=512)
+    def quick_lines(bv_side: int, addr: int) -> tuple[str, ...]:
+        bv = primary_bv if bv_side == 0 else secondary_bv
+        func = bv.get_function_at(addr)
+        if func is None:
+            return ()
+        return tuple(
+            align.normalize_line("".join(token.text for token in tokens))
+            for block in sorted(func.basic_blocks, key=lambda block: block.start)
+            for tokens, _length in block
+        )
+
+    named = []
+    secondary_names = _anchor_names(secondary)
+    for name, left_addr in _anchor_names(primary).items():
+        right_addr = secondary_names.get(name)
+        if right_addr is None:
+            continue
+        row, col = primary_mapping[left_addr], secondary_mapping[right_addr]
+        if row in used_left or col in used_right:
+            continue
+        left = primary_bv.get_function_at(left_addr)
+        right = secondary_bv.get_function_at(right_addr)
+        if left is None or right is None:
+            continue
+        n_left = sum(block.instruction_count for block in left.basic_blocks)
+        n_right = sum(block.instruction_count for block in right.basic_blocks)
+        if min(n_left, n_right) == 0 or max(n_left, n_right) > 512:
+            continue
+        size_ratio = min(n_left, n_right) / max(n_left, n_right)
+        if size_ratio < 0.65:
+            continue
+        feature_score = float(sim_matrix[row, col])
+        if 0 <= feature_score < 0.2:
+            continue
+        if feature_score >= 0.75 and size_ratio >= 0.8:
+            left_quick, right_quick = quick_lines(0, left_addr), quick_lines(1, right_addr)
+            if left_quick and right_quick and difflib.SequenceMatcher(
+                None, left_quick, right_quick, autojunk=False
+            ).ratio() >= 0.8:
+                named.append((row, col))
+                continue
+        left_lines, right_lines = lines(0, left_addr), lines(1, right_addr)
+        if not left_lines or not right_lines:
+            continue
+        if align.text_similarity(align.align_lines(left_lines, right_lines)) < 0.35:
+            continue
+        named.append((row, col))
+    pin(named)
+    log_info(
+        f"Anchored {len(exact)} unique exact-code and {len(named)} verified-name pairs",
+        "QBinDiff",
+    )
+
+
+def far_from_local_anchors(
+    primary_addr: int, secondary_addr: int, exact_pairs: list[tuple[int, int]]
+) -> bool:
+    """Whether a low-evidence pair contradicts nearby exact-code landmarks.
+
+    Reordering code is legitimate, so location alone never rejects a match.
+    This check is only used after both code comparisons find almost nothing.
+    Two close, order-preserving exact anchors are needed to establish locality.
+    """
+
+    index = bisect.bisect_left(exact_pairs, (primary_addr, -1))
+    if index == 0 or index == len(exact_pairs):
+        return False
+    left, right = exact_pairs[index - 1], exact_pairs[index]
+    gap = right[0] - left[0]
+    if gap > 0x10000 or right[1] < left[1]:
+        return False
+    margin = max(0x1000, gap // 2)
+    return not left[1] - margin <= secondary_addr <= right[1] + margin
+
+
+def demote_unsubstantiated_matches(result: DiffResult, exact_pairs: set[tuple[int, int]]) -> None:
+    """Leave implausible forced matches unmatched on both sides.
+
+    QBinDiff's assignment can pair every function of the smaller binary even
+    when its own similarity is zero. Only demote when line comparison also
+    finds little in common and exact-code neighbors contradict the location.
+    A genuine large rewrite near its old code remains paired for review.
+    """
+
+    from . import align
+
+    landmarks = sorted(exact_pairs)
+    kept: list[MatchRecord] = []
+    removed: list[MatchRecord] = []
+    for match in result.matches:
+        if match.similarity >= 0.05 or (
+            match.primary.name == match.secondary.name
+            and not is_generated_name(match.primary.name)
+        ):
+            kept.append(match)
+            continue
+        if not far_from_local_anchors(match.primary.addr, match.secondary.addr, landmarks):
+            kept.append(match)
+            continue
+        left = result.primary_bv.get_function_at(match.primary.addr)
+        right = result.secondary_bv.get_function_at(match.secondary.addr)
+        if left is None or right is None:
+            kept.append(match)
+            continue
+        try:
+            _status, rows = align.classify_pair(left, right)
+        except Exception:
+            kept.append(match)
+            continue
+        if not rows or align.text_similarity(rows) >= 0.25:
+            kept.append(match)
+            continue
+        removed.append(match)
+    if not removed:
         return
-    rows, cols = zip(*pairs, strict=True)
-    sim_matrix[rows, :] = 0
-    sim_matrix[:, cols] = 0
-    sim_matrix[rows, cols] = 1
-    log_info(f"Anchored {len(pairs)} function pair(s) by symbol name", "QBinDiff")
+    result.matches = kept
+    result.primary_unmatched.extend(match.primary for match in removed)
+    result.secondary_unmatched.extend(match.secondary for match in removed)
+    result.primary_unmatched.sort(key=lambda ref: ref.addr)
+    result.secondary_unmatched.sort(key=lambda ref: ref.addr)
+    result.reindex()
+    log_warn(
+        f"Left {len(removed)} low-evidence, out-of-region pair(s) unmatched",
+        "QBinDiff",
+    )
 
 
 class _BinjaLogHandler(logging.Handler):
@@ -734,7 +938,15 @@ def run_diff(
             maxiter=options.maxiter,
             sparse_row=options.sparse_row,
         )
-        differ.register_postpass(match_named_functions)
+        exact_pairs: set[tuple[int, int]] = set()
+        differ.register_postpass(
+            partial(
+                match_named_functions,
+                primary_bv=primary_bv,
+                secondary_bv=secondary_bv,
+                exact_pairs=exact_pairs,
+            )
+        )
 
         selected = feature_extractors(options.features)
         for extractor in selected:
@@ -794,6 +1006,7 @@ def run_diff(
         if mapping is None:
             return None
         result = DiffResult.build(primary_bv, secondary_bv, mapping)
+        demote_unsubstantiated_matches(result, exact_pairs)
         result.timings = timings
         return result
 

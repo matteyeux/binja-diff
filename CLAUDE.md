@@ -766,8 +766,12 @@ preserve:
   `dynamicSortFilter` is off, so a batch never re-sorts rows out from under the
   reader; `_on_classified` re-applies only a status filter.
 
-`FunctionStatus.UNKNOWN` ("differs") is the escape hatch above
+`FunctionStatus.UNKNOWN` ("unclassified") is the escape hatch above
 `MAX_CLASSIFY_INSTRUCTIONS`; keep it, or one enormous function stalls painting.
+`align.edit_pattern()` fingerprints non-minor edits for UI repetition counts.
+It preserves literal values and resolved targets, and a repeated pattern must
+never silently downgrade a `changed` verdict: a small repeated patch can be
+security-relevant in every caller.
 
 ### Block pairing: text first, topology second
 

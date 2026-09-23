@@ -45,7 +45,7 @@ HERE = Path(__file__).resolve().parent
 sys.path[:] = [entry for entry in sys.path if Path(entry or ".").resolve() != HERE]
 
 #: Statuses worth printing without --all: what the reader is looking for.
-INTERESTING = ("changed", "differs", "offsets only")
+INTERESTING = ("changed", "unclassified", "offsets only")
 
 
 def _package():
@@ -142,14 +142,18 @@ def classify(result, align, limit: int, show_all: bool) -> tuple[dict[str, int],
         same = None
         if left is None or right is None:
             status = "missing"
+            review = False
         else:
             verdict, aligned = align.classify_pair(left, right)
             status = verdict.value if verdict is not None else "unknown"
             if aligned:
                 same = align.text_similarity(aligned)
+            review = align.pairing_needs_review(match.similarity, same)
+        if review:
+            counts["_review"] = counts.get("_review", 0) + 1
         counts[status] = counts.get(status, 0) + 1
         if show_all or status in INTERESTING:
-            rows.append((status, match, same))
+            rows.append((status, match, same, review))
     order = {status: index for index, status in enumerate(INTERESTING)}
     rows.sort(key=lambda row: (order.get(row[0], len(order)), row[1].primary.addr))
     return counts, rows[:limit] if limit else rows
@@ -158,11 +162,17 @@ def classify(result, align, limit: int, show_all: bool) -> tuple[dict[str, int],
 def report(result, counts: dict[str, int], rows: list[tuple], show_all: bool) -> None:
     total = len(result.matches)
     print()
-    print(f"similarity : {result.similarity:.3f}")
+    print(f"similarity : {result.similarity:.3f} (QBinDiff graph score, not match precision)")
     print(f"matched    : {total}")
     if counts:
-        summary = "  ".join(f"{status} {count}" for status, count in sorted(counts.items()))
+        summary = "  ".join(
+            f"{status} {count}"
+            for status, count in sorted(counts.items())
+            if not status.startswith("_")
+        )
         print(f"             {summary}")
+        if counts.get("_review"):
+            print(f"verify pair: {counts['_review']} low-evidence match(es), marked ? below")
     print(
         f"unmatched  : {len(result.primary_unmatched)} primary, "
         f"{len(result.secondary_unmatched)} secondary"
@@ -187,13 +197,14 @@ def report(result, counts: dict[str, int], rows: list[tuple], show_all: bool) ->
         # score: that one is a MinHash over whole basic blocks and reads 0.000
         # for a one-block function that gained a single instruction.
         print(f"{'status':<14} {'primary':<18} {'secondary':<18} {'sim%':>5}  name")
-        for status, match, same in rows:
+        for status, match, same, review in rows:
             name = match.primary.name
             if match.secondary.name != name:
                 name = f"{name} -> {match.secondary.name}"
             share = f"{same * 100:4.0f}%" if same is not None else "   -"
+            status_label = status + (" ?" if review else "")
             print(
-                f"{status:<14} 0x{match.primary.addr:<16x} 0x{match.secondary.addr:<16x} "
+                f"{status_label:<14} 0x{match.primary.addr:<16x} 0x{match.secondary.addr:<16x} "
                 f"{share:>5}  {name}"
             )
     elif counts:

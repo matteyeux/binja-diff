@@ -129,7 +129,7 @@ def test_only_differences_are_listed():
     check("offsets recognized", counts.get("offsets only") == 1, f"{counts}")
     check("change recognized", counts.get("changed") == 1, f"{counts}")
 
-    printed = [match.primary.name for _status, match, _same in rows]
+    printed = [match.primary.name for _status, match, _same, _review in rows]
     check("only what differs is listed", printed == ["rewritten", "moved"], f"{printed}")
     check("changed comes first", rows[0][0] == "changed", f"{rows[0][0]}")
     # The reported share is the line comparison, not QBinDiff's score: the
@@ -167,11 +167,27 @@ def test_report_says_what_happened():
     check("nothing to show says so", "no differences" in quiet.getvalue(), quiet.getvalue())
 
 
+def test_low_evidence_pair_is_visible():
+    print("low-evidence matches are visible even when confidence is high")
+    result = result_with([("doubt", ["mov x0, x1"], ["brk #0x1"])])
+    old = result.matches[0]
+    result.matches[0] = MatchRecord(old.primary, old.secondary, 0.0, 0.99)
+    counts, rows = cli.classify(result, align, limit=0, show_all=False)
+    check("review counted", counts.get("_review") == 1)
+    check("row carries review flag", rows[0][3] is True)
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        cli.report(result, counts, rows, show_all=False)
+    check("review marker explained", "verify pair: 1" in out.getvalue())
+    check("row marked", "changed ?" in out.getvalue())
+
+
 def main() -> int:
     for test in (
         test_argument_contract,
         test_only_differences_are_listed,
         test_report_says_what_happened,
+        test_low_evidence_pair_is_visible,
     ):
         test()
     print()

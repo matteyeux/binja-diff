@@ -16,6 +16,8 @@ pair the user has selected.
 from __future__ import annotations
 
 import difflib
+import hashlib
+import json
 import re
 from dataclasses import dataclass, field
 from enum import Enum
@@ -259,6 +261,15 @@ _SHAPE_PLACEHOLDER = {
     InstructionTextTokenType.AnnotationToken: "",
 }
 
+# These instructions name architectural state in a register-looking operand.
+# Treating that operand as ordinary register allocation makes writes to two
+# different control/key registers look like a harmless register rename. The
+# set describes instruction semantics, not a particular firmware or register.
+_STATE_REGISTER_MNEMONICS = {
+    "msr", "mrs",  # ARM system registers
+    "csrrw", "csrrs", "csrrc", "csrrwi", "csrrsi", "csrrci",  # RISC-V CSRs
+}
+
 
 def _tokens_of(line):
     """Tokens for a line, unwrapping ``LinearDisassemblyLine`` if needed."""
@@ -372,9 +383,20 @@ def shape_signature(line) -> str | None:
     if not tokens:
         return None
 
+    mnemonic = next(
+        (
+            token.text.strip().lower()
+            for token in tokens
+            if token.type == InstructionTextTokenType.InstructionToken
+        ),
+        "",
+    )
+    preserve_registers = mnemonic in _STATE_REGISTER_MNEMONICS
     parts: list[str] = []
     for token in tokens:
         placeholder = _SHAPE_PLACEHOLDER.get(token.type)
+        if preserve_registers and token.type == InstructionTextTokenType.RegisterToken:
+            placeholder = None
         parts.append(token.text if placeholder is None else placeholder)
     return _WS.sub(" ", "".join(parts)).strip()
 
@@ -857,8 +879,9 @@ class FunctionStatus(str, Enum):
     #: register allocation. The `~` tier, at function scale.
     MINOR = "offsets only"
     CHANGED = "changed"
-    #: Too large to classify without making the table stutter.
-    UNKNOWN = "differs"
+    #: Too large to classify without making the table stutter; no difference
+    #: verdict has been reached, so the user-facing text must say that.
+    UNKNOWN = "unclassified"
 
 
 #: Above this many instructions on either side, classifying a pair is skipped.
@@ -967,3 +990,42 @@ def summarize(rows: Iterable[AlignedRow]) -> dict[str, int]:
     for row in rows:
         counts[row.status.value] += 1
     return counts
+
+
+def edit_pattern(rows: Sequence[AlignedRow]) -> str | None:
+    """Fingerprint the non-minor edits in one aligned function pair.
+
+    This is evidence of a *repeated edit*, not a verdict that the edit is
+    unimportant. Keep literal values and resolved targets distinct: folding
+    them as ``normalize_line`` does could group two security-relevant constant
+    changes. Function names and binary-specific logging conventions play no
+    part in the fingerprint. Row count and edit positions prevent a shared
+    one-line operation in unrelated functions from being grouped too eagerly.
+    """
+
+    edits = [
+        (
+            index,
+            row.status.value,
+            compare_line(instruction_text(row.left)) if row.left is not None else None,
+            compare_line(instruction_text(row.right)) if row.right is not None else None,
+        )
+        for index, row in enumerate(rows)
+        if row.status in (LineStatus.CHANGED, LineStatus.ADDED, LineStatus.REMOVED)
+    ]
+    if not edits:
+        return None
+    payload = json.dumps((len(rows), edits), ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def pairing_needs_review(matcher_similarity: float, line_similarity: float | None) -> bool:
+    """Flag a pairing when independent code comparisons both find little support.
+
+    Belief-propagation confidence is conditional on the available candidates,
+    so even a completely unrelated forced pair can have confidence near 1.
+    This is a review cue, not an automatic rejection: a genuine rewrite can
+    share almost no code with its old version.
+    """
+
+    return line_similarity is not None and matcher_similarity < 0.05 and line_similarity < 0.25

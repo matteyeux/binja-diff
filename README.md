@@ -92,7 +92,15 @@ binary those are most of the lines, and colouring them hides the real change.
 | identical | no differing instructions at all |
 | offsets only | only addresses, immediates, stack offsets or register choice differ |
 | changed | at least one real instruction difference |
-| differs | too large to classify while scrolling; open it to see |
+| unclassified | too large to classify while scrolling; open it to see |
+
+The match table marks **verify pair** when the graph matcher and line comparison
+both find little shared code. Use **Show: Verify pair** to review these pairs.
+Matcher confidence is relative to its candidates; a high number can still
+accompany a wrong pairing. Unique identical code is matched first, and a
+shared function name is only pinned when the code also supports it. A very
+weak match that contradicts nearby identical functions is shown as unmatched
+on both sides.
 
 
 | Marker | Meaning |

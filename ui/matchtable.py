@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 from enum import Enum
 from functools import partial
@@ -79,7 +80,7 @@ _COLUMNS = (
     ("Address", 100),
     ("Similarity", 90),
     ("Confidence", 90),
-    ("Status", 110),
+    ("Status", 185),
 )
 
 
@@ -95,7 +96,10 @@ _HEADER_TOOLTIPS = {
         "are identical or differ only in an operand's spelling, over the longer\n"
         "side. Computed from the same comparison the panes draw."
     ),
-    5: "How sure the matcher is of the pairing, from belief propagation over the call graph.",
+    5: (
+        "Belief-propagation confidence among the matcher's candidates. A high value"
+        " does not prove the functions correspond; check the code similarity and status."
+    ),
     6: "How the code compares, line by line. Hover a cell for the differing lines.",
 }
 
@@ -121,7 +125,11 @@ def _classify_off_thread(result: DiffResult, key: tuple[int, int]):
     status, rows = align.classify_pair(primary, secondary, _LEVEL)
     if status is None:
         return None
-    return status, (align.text_similarity(rows) if rows else None)
+    return (
+        status,
+        align.text_similarity(rows) if rows else None,
+        align.edit_pattern(rows) if status is FunctionStatus.CHANGED else None,
+    )
 
 
 def _status_color(status: FunctionStatus | None):
@@ -149,6 +157,10 @@ class MatchTableModel(QAbstractTableModel):
         self._status: dict[tuple[int, int], FunctionStatus] = {}
         #: Per-pair line similarity, filled by the same pass as the status.
         self._same: dict[tuple[int, int], float] = {}
+        #: Repeated edits remain separate rows; this only annotates exact
+        #: repetitions of a conservative, binary-agnostic fingerprint.
+        self._patterns: dict[tuple[int, int], str] = {}
+        self._pattern_counts: Counter[str] = Counter()
         #: Tooltip text per pair, filled on hover. See explain().
         self._explained: dict[tuple[int, int], str] = {}
         #: Classifies every matched pair in the background, so the summary and
@@ -187,10 +199,33 @@ class MatchTableModel(QAbstractTableModel):
             # Not drawn yet. Leave the cell blank and ask again on the next
             # repaint rather than record a verdict taken from half a function.
             return None, None
-        self._status[key] = status
-        if rows:
-            self._same[key] = align.text_similarity(rows)
+        self._remember(
+            key,
+            status,
+            align.text_similarity(rows) if rows else None,
+            align.edit_pattern(rows) if status is FunctionStatus.CHANGED else None,
+        )
         return status, self._same.get(key)
+
+    def _remember(
+        self,
+        key: tuple[int, int],
+        status: FunctionStatus,
+        same: float | None,
+        pattern: str | None,
+    ) -> None:
+        self._status.setdefault(key, status)
+        if same is not None:
+            self._same.setdefault(key, same)
+        if pattern is not None and key not in self._patterns:
+            self._patterns[key] = pattern
+            self._pattern_counts[pattern] += 1
+
+    def pattern_count_of(self, row: MatchRow) -> int:
+        if row.primary_addr is None or row.secondary_addr is None:
+            return 0
+        pattern = self._patterns.get((row.primary_addr, row.secondary_addr))
+        return self._pattern_counts[pattern] if pattern is not None else 0
 
     def status_of(self, row: MatchRow) -> FunctionStatus | None:
         """How the pair actually compares, or None if it cannot be worked out."""
@@ -262,6 +297,17 @@ class MatchTableModel(QAbstractTableModel):
             return None
         return self._status.get((row.primary_addr, row.secondary_addr))
 
+    def cached_review(self, row: MatchRow) -> bool:
+        """Whether completed classification found little evidence for the pair."""
+
+        if not row.is_matched or row.primary_addr is None or row.secondary_addr is None:
+            return False
+        same = self._same.get((row.primary_addr, row.secondary_addr))
+        return align.pairing_needs_review(row.similarity, same)
+
+    def review_count(self) -> int:
+        return sum(self.cached_review(row) for row in self._rows)
+
     def counts(self) -> dict[str, int]:
         """Rows per summary category; see `SummaryBar.CATEGORIES`."""
 
@@ -295,10 +341,8 @@ class MatchTableModel(QAbstractTableModel):
         for key, value in batch:
             if value is None:
                 continue
-            status, same = value
-            self._status.setdefault(key, status)
-            if same is not None:
-                self._same.setdefault(key, same)
+            status, same, pattern = value
+            self._remember(key, status, same, pattern)
         if self._rows:
             self.dataChanged.emit(
                 self.index(0, 0), self.index(len(self._rows) - 1, len(_COLUMNS) - 1)
@@ -313,6 +357,8 @@ class MatchTableModel(QAbstractTableModel):
         self._result = result
         self._status.clear()
         self._same.clear()
+        self._patterns.clear()
+        self._pattern_counts.clear()
         self._explained.clear()
         if result is not None:
             for match in result.matches:
@@ -385,7 +431,14 @@ class MatchTableModel(QAbstractTableModel):
                 if not row.is_matched:
                     return row.kind.value
                 status = self.status_of(row)
-                return status.value if status is not None else RowKind.MATCHED.value
+                warning = " · verify pair" if align.pairing_needs_review(
+                    row.similarity, self.line_similarity_of(row)
+                ) else ""
+                if status is FunctionStatus.CHANGED:
+                    count = self.pattern_count_of(row)
+                    if count > 1:
+                        return f"{status.value} · {count}×{warning}"
+                return (status.value if status is not None else RowKind.MATCHED.value) + warning
 
         # Sort on the raw values so numeric columns order correctly. The status
         # column sorts on what has been classified already — sorting asks every
@@ -419,7 +472,22 @@ class MatchTableModel(QAbstractTableModel):
 
         if role == Qt.ToolTipRole:
             if column == 6:
-                return self.explain(row)
+                detail = self.explain(row)
+                if row.is_matched and align.pairing_needs_review(
+                    row.similarity, self.line_similarity_of(row)
+                ):
+                    detail = (
+                        "Pairing needs review: the graph matcher and line comparison both"
+                        " found little common code. High matching confidence can still"
+                        " occur when no good alternative was available.\n\n" + detail
+                    )
+                count = self.pattern_count_of(row)
+                if count > 1:
+                    detail += (
+                        f"\n\nThe same non-minor edit pattern appears in {count} function pairs."
+                        " Repetition does not establish cause or importance."
+                    )
+                return detail
             if column == 4 and row.is_matched:
                 same = self.line_similarity_of(row)
                 lines = [_HEADER_TOOLTIPS[4]]
@@ -440,15 +508,19 @@ class _FilterProxy(QSortFilterProxyModel):
         self.setSortRole(Qt.UserRole)
         self._kind: RowKind | None = None
         self._status: FunctionStatus | None = None
+        self._review = False
         self._text = ""
 
     @property
     def filters_on_status(self) -> bool:
-        return self._status is not None
+        return self._status is not None or self._review
 
-    def set_filter(self, kind: RowKind | None, status: FunctionStatus | None) -> None:
+    def set_filter(
+        self, kind: RowKind | None, status: FunctionStatus | None, review: bool = False
+    ) -> None:
         self._kind = kind
         self._status = status
+        self._review = review
         self.invalidateFilter()
 
     def set_text(self, text: str) -> None:
@@ -472,6 +544,8 @@ class _FilterProxy(QSortFilterProxyModel):
             # rows join the filtered view as their verdicts land.
             if model.cached_status(row) != self._status:
                 return False
+        if self._review and not model.cached_review(row):
+            return False
         if self._text:
             haystack = f"{row.primary_name} {row.secondary_name}".lower()
             if self._text not in haystack:
@@ -590,8 +664,14 @@ class MatchTable(QWidget):
         for kind in RowKind:
             self.filter_combo.addItem(kind.value.title(), f"kind:{kind.value}")
         self.filter_combo.insertSeparator(self.filter_combo.count())
-        for status in (FunctionStatus.IDENTICAL, FunctionStatus.MINOR, FunctionStatus.CHANGED):
+        for status in (
+            FunctionStatus.IDENTICAL,
+            FunctionStatus.MINOR,
+            FunctionStatus.CHANGED,
+            FunctionStatus.UNKNOWN,
+        ):
             self.filter_combo.addItem(status.value.title(), f"status:{status.value}")
+        self.filter_combo.addItem("Verify pair", "review:pair")
         self.filter_combo.currentIndexChanged.connect(self._apply_filter)
         controls.addWidget(QLabel("Show:", self))
         controls.addWidget(self.filter_combo)
@@ -653,13 +733,16 @@ class MatchTable(QWidget):
 
         selected = self.filter_combo.itemData(index)
         kind = status = None
+        review = False
         if isinstance(selected, str):
             group, _, value = selected.partition(":")
             if group == "kind":
                 kind = RowKind(value)
             elif group == "status":
                 status = FunctionStatus(value)
-        self.proxy.set_filter(kind, status)
+            elif group == "review":
+                review = True
+        self.proxy.set_filter(kind, status, review)
 
     def _filter_to_category(self, key: str) -> None:
         """Point the Show: combo at a summary-bar segment."""
@@ -670,6 +753,7 @@ class MatchTable(QWidget):
             FunctionStatus.IDENTICAL.value: f"status:{FunctionStatus.IDENTICAL.value}",
             FunctionStatus.MINOR.value: f"status:{FunctionStatus.MINOR.value}",
             FunctionStatus.CHANGED.value: f"status:{FunctionStatus.CHANGED.value}",
+            FunctionStatus.UNKNOWN.value: f"status:{FunctionStatus.UNKNOWN.value}",
         }.get(key)
         if wanted is None:
             return
@@ -689,6 +773,9 @@ class MatchTable(QWidget):
         ]
         if pending and not finished:
             parts.append(f"classifying {classified - pending}/{classified}")
+        review_count = self.model.review_count()
+        if review_count:
+            parts.append(f"{review_count} verify pair")
         self.summary_text.setText("   ".join(parts))
         if self.proxy.filters_on_status:
             self.proxy.invalidateFilter()
@@ -738,13 +825,18 @@ class MatchTable(QWidget):
         self._on_classified(False)
         if result is None:
             self.stats.setText("")
+            self.stats.setToolTip("")
             self.summary_text.setText("")
             return
         self.stats.setText(
             f"{result.nb_match} matched   "
             f"{result.nb_unmatched_primary} primary-only   "
             f"{result.nb_unmatched_secondary} secondary-only   "
-            f"similarity {result.similarity:.3f}"
+            f"graph score {result.similarity:.3f}"
+        )
+        self.stats.setToolTip(
+            "QBinDiff's aggregate graph score. It does not measure matching accuracy;"
+            " review pairs marked 'verify pair'."
         )
         if self.proxy.rowCount() > 0:
             self.table.selectRow(0)

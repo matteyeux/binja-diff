@@ -272,22 +272,110 @@ def test_name_anchor_pass():
         0x4000: "sub_4000",
         0x5000: "printf",
     }
-    primary = Program.from_backend(ProgramBackendBinja(build_named_view("primary", layout)))
-    secondary = Program.from_backend(ProgramBackendBinja(build_named_view("secondary", layout)))
+    primary_bv = build_named_view("primary", layout)
+    secondary_bv = build_named_view("secondary", layout)
+    primary = Program.from_backend(ProgramBackendBinja(primary_bv))
+    secondary = Program.from_backend(ProgramBackendBinja(secondary_bv))
 
     p_map = {addr: i for i, (addr, _) in enumerate(primary.items())}
     s_map = {addr: i for i, (addr, _) in enumerate(secondary.items())}
     sim = np.full((len(p_map), len(s_map)), -1, dtype=np.float32)
 
-    engine.match_named_functions(sim, primary, secondary, p_map, s_map)
+    engine.match_named_functions(
+        sim, primary, secondary, p_map, s_map,
+        primary_bv=primary_bv, secondary_bv=secondary_bv,
+    )
 
     alpha_row = sim[p_map[0x1000]]
     check("alpha anchored", alpha_row[s_map[0x1000]] == 1, f"got {alpha_row}")
     check("alpha row zeroed elsewhere", sum(alpha_row) == 1, f"got {alpha_row}")
     check("alpha column zeroed", sum(sim[:, s_map[0x1000]]) == 1, f"got {sim[:, s_map[0x1000]]}")
-    for label, addr in (("duplicate name", 0x2000), ("auto name", 0x4000), ("import", 0x5000)):
-        check(f"{label} not anchored", 1 not in sim[p_map[addr]], f"got {sim[p_map[addr]]}")
-        check(f"{label} row left for features", -1 in sim[p_map[addr]], f"got {sim[p_map[addr]]}")
+    for label, addr in (("duplicate name", 0x2000), ("auto name", 0x4000)):
+        check(f"{label} exact code at same address anchored", sim[p_map[addr], s_map[addr]] == 1)
+    check("import not anchored", 1 not in sim[p_map[0x5000]])
+    check("import row left for features", -1 in sim[p_map[0x5000]])
+
+
+def test_exact_code_anchor_and_bad_name():
+    print("exact code overrides ambiguous graph features; bad name stays unpinned")
+    import numpy as np
+
+    from binja_diff.core import engine
+
+    primary_bv = build_named_view("primary", {0x1000: "sub_1000", 0x2000: "sub_2000"})
+    secondary_bv = build_named_view("secondary", {0x1000: "sub_1000", 0x2000: "sub_2000"})
+    primary_bv.read = lambda addr, length: (b"A" if addr == 0x1000 else b"B") * length
+    secondary_bv.read = lambda addr, length: (b"B" if addr == 0x1000 else b"A") * length
+    primary = Program.from_backend(ProgramBackendBinja(primary_bv))
+    secondary = Program.from_backend(ProgramBackendBinja(secondary_bv))
+    p_map = {addr: i for i, (addr, _) in enumerate(primary.items())}
+    s_map = {addr: i for i, (addr, _) in enumerate(secondary.items())}
+    sim = np.full((2, 2), -1, dtype=np.float32)
+    engine.match_named_functions(
+        sim, primary, secondary, p_map, s_map,
+        primary_bv=primary_bv, secondary_bv=secondary_bv,
+    )
+    check("unique code pairs across addresses", sim[p_map[0x1000], s_map[0x2000]] == 1)
+    check("other unique code pair", sim[p_map[0x2000], s_map[0x1000]] == 1)
+
+    primary_bv = build_named_view("primary", {0x1000: "same_name"})
+    secondary_bv = build_named_view("secondary", {0x2000: "same_name"})
+    secondary_bv.functions[0].basic_blocks[0].instructions.extend([insn("nop")] * 6)
+    primary_bv.read = lambda addr, length: b"A" * length
+    secondary_bv.read = lambda addr, length: b"B" * length
+    primary = Program.from_backend(ProgramBackendBinja(primary_bv))
+    secondary = Program.from_backend(ProgramBackendBinja(secondary_bv))
+    sim = np.full((1, 1), 0.1, dtype=np.float32)
+    engine.match_named_functions(
+        sim, primary, secondary, {0x1000: 0}, {0x2000: 0},
+        primary_bv=primary_bv, secondary_bv=secondary_bv,
+    )
+    check("incompatible same-name functions not pinned", np.isclose(sim[0, 0], 0.1))
+
+    secondary_bv.functions[0].basic_blocks[0].instructions = [insn("xor"), insn("brk")]
+    secondary = Program.from_backend(ProgramBackendBinja(secondary_bv))
+    sim = np.full((1, 1), 0.9, dtype=np.float32)
+    engine.match_named_functions(
+        sim, primary, secondary, {0x1000: 0}, {0x2000: 0},
+        primary_bv=primary_bv, secondary_bv=secondary_bv,
+    )
+    check("high feature score cannot pin unrelated code", np.isclose(sim[0, 0], 0.9))
+
+
+def test_weak_pair_demoted_only_with_local_contradiction():
+    print("weak forced matches can remain unmatched")
+    from binja_diff.core import engine
+
+    landmarks = {(0x1000, 0x1100), (0x2000, 0x2100)}
+    check("distant match contradicts exact neighbors", engine.far_from_local_anchors(
+        0x1800, 0x9000, sorted(landmarks)
+    ))
+    check("nearby rewrite stays plausible", not engine.far_from_local_anchors(
+        0x1900, 0x2000, sorted(landmarks)
+    ))
+
+    primary_bv = build_named_view("primary", {0x1800: "sub_1800", 0x1900: "sub_1900"})
+    secondary_bv = build_named_view("secondary", {0x9000: "sub_9000", 0x2000: "sub_2000"})
+    for function in secondary_bv.functions:
+        function.basic_blocks[0].instructions = [insn("brk"), insn("nop")]
+    matches = [
+        engine.MatchRecord(
+            engine.FunctionRef(0x1800, "sub_1800"),
+            engine.FunctionRef(0x9000, "sub_9000"), 0.0, 0.99,
+        ),
+        engine.MatchRecord(
+            engine.FunctionRef(0x1900, "sub_1900"),
+            engine.FunctionRef(0x2000, "sub_2000"), 0.0, 0.99,
+        ),
+    ]
+    result = engine.DiffResult(primary_bv, secondary_bv, 0.9, matches=matches)
+    engine.demote_unsubstantiated_matches(result, landmarks)
+    check("far unrelated pair demoted", 0x1800 not in result.by_primary)
+    check("nearby rewrite remains paired", 0x1900 in result.by_primary)
+    check("both sides become unmatched", (
+        [f.addr for f in result.primary_unmatched],
+        [f.addr for f in result.secondary_unmatched],
+    ) == ([0x1800], [0x9000]))
 
 
 def test_name_anchor_end_to_end():
@@ -390,6 +478,8 @@ def main() -> int:
         test_import_calls_feature,
         test_instr_group_features,
         test_name_anchor_pass,
+        test_exact_code_anchor_and_bad_name,
+        test_weak_pair_demoted_only_with_local_contradiction,
         test_name_anchor_end_to_end,
         test_line_alignment,
         test_block_alignment,
