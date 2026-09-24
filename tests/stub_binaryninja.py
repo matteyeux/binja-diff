@@ -49,6 +49,7 @@ class InstructionTextTokenType(IntEnum):
     AnnotationToken = 9
     CodeRelativeAddressToken = 10
     CharacterConstantToken = 18
+    TagToken = 24
     CommentToken = 29
     OperationToken = 36
     BraceToken = 39

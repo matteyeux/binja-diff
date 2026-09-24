@@ -218,6 +218,92 @@ def test_change_visibility():
         rows[0].status is align.LineStatus.MINOR,
         f"{rows[0].status}",
     )
+
+    # The tokens carry their targets. A name for the very address the other side
+    # printed is the same call; one view merely resolved the import.
+    def call_to(kind: str, text: str, target: int):
+        line = call(kind, text)
+        line.tokens = [*line.tokens[:-1], Token(getattr(TT, kind), text, target)]
+        return line
+
+    rows = align.align_lines(
+        [call_to("PossibleAddressToken", "0x431970", 0x431970)],
+        [call_to("ImportToken", "__stack_chk_fail", 0x431970)],
+    )
+    check(
+        "a name for the same address is EQUAL",
+        rows[0].status is align.LineStatus.EQUAL,
+        f"{rows[0].status}",
+    )
+    rows = align.align_lines(
+        [call_to("PossibleAddressToken", "0x431970", 0x431970)],
+        [call_to("ImportToken", "__stack_chk_fail", 0x431990)],
+    )
+    check(
+        "a name for another address stays MINOR",
+        rows[0].status is align.LineStatus.MINOR,
+        f"{rows[0].status}",
+    )
+
+    # A name one side gave the callee, against the placeholder the other kept.
+    rows = align.align_lines(
+        [call_to("CodeSymbolToken", "vm_interp_dispatch", 0x453694)],
+        [call_to("CodeSymbolToken", "sub_453694", 0x453694)],
+    )
+    check(
+        "a renamed callee against its placeholder is EQUAL",
+        rows[0].status is align.LineStatus.EQUAL,
+        f"{rows[0].status}",
+    )
+    rows = align.align_lines(
+        [call_to("CodeSymbolToken", "memcpy", 0x453694)],
+        [call_to("CodeSymbolToken", "malloc", 0x453694)],
+    )
+    check(
+        "two real names are still a change",
+        rows[0].status is align.LineStatus.CHANGED,
+        f"{rows[0].status}",
+    )
+
+    # A view that defined a string there spells the page as the string plus an
+    # index; the symbol token's value is the address meant, index included.
+    def adrp(*spec):
+        line = call("TextToken", "")
+        line.tokens = [Token(TT.InstructionToken, "adrp"), Token(TT.TextToken, "    ")] + [
+            Token(getattr(TT, kind), text, value) for kind, text, value in spec
+        ]
+        return line
+
+    page = adrp(("DataSymbolToken", "data_591000", 0x591000))
+    indexed = [
+        ("BraceToken", "[", 0),
+        ("IntegerToken", "1", 1),
+        ("BraceToken", "]", 0),
+    ]
+    rows = align.align_lines([page], [adrp(("DataSymbolToken", "s_data_data", 0x591000), *indexed)])
+    check(
+        "a variable plus an index at the same address is EQUAL",
+        rows[0].status is align.LineStatus.EQUAL,
+        f"{rows[0].status}",
+    )
+    rows = align.align_lines([page], [adrp(("DataSymbolToken", "s_data_data", 0x592000), *indexed)])
+    check(
+        "and at another address it is not",
+        rows[0].status is not align.LineStatus.EQUAL,
+        f"{rows[0].status}",
+    )
+
+    class Block:
+        def __init__(self, *lines):
+            self.disassembly_text = list(lines)
+
+    check(
+        "so the block is identical",
+        align._blocks_identical(
+            Block(call_to("PossibleAddressToken", "0x431970", 0x431970)),
+            Block(call_to("CodeSymbolToken", "__stack_chk_fail", 0x431970)),
+        ),
+    )
     # Both sides know what they call, and disagree: a real change.
     rows = align.align_lines([call("CodeSymbolToken", "memcpy")], [resolved])
     check(
@@ -612,9 +698,13 @@ def test_il_is_generated_before_rendering():
         align.ensure_il(func, level)
         check(f"{level} generates {attribute}", func.touched == [attribute], f"got {func.touched}")
 
+    # Disassembly is rendered without symbols or {var_...} while no LLIL exists.
     func = FakeFunction()
-    check("disassembly needs nothing generated", align.ensure_il(func, "Disassembly") is None)
-    check("and touches no IL", func.touched == [], f"got {func.touched}")
+    check("disassembly returns no IL", align.ensure_il(func, "Disassembly") is None)
+    check("but generates llil", func.touched == ["llil"], f"got {func.touched}")
+    func = FakeFunction()
+    align.il_basic_blocks(func, "Disassembly")
+    check("and so do its basic blocks", func.touched == ["llil"], f"got {func.touched}")
 
     # A function whose analysis was skipped has no IL and never will.
     func = FakeFunction(available=False)
@@ -735,6 +825,7 @@ def test_comments_are_not_code():
 
     class Line:
         def __init__(self, *spec):
+            self.tokens_spec = spec
             self.tokens = [Token(getattr(TT, kind), text) for kind, text in spec]
 
         def __str__(self):
@@ -801,6 +892,41 @@ def test_comments_are_not_code():
         align.classify_rows(rows) is not align.FunctionStatus.IDENTICAL,
         f"{[row.status.value for row in rows]}",
     )
+
+    # The renderer types numbers inside a comment as integers; copied from a
+    # real ARM64 line, where the comment is attached to the instruction.
+    real = Line(
+        ("InstructionToken", "adrp"),
+        ("TextToken", "    "),
+        ("RegisterToken", "x15"),
+        ("OperandSeparatorToken", ", "),
+        ("PossibleAddressToken", "0x453000"),
+        ("TextToken", "  "),
+        ("CommentToken", "// "),
+        ("CommentToken", "variant of op23 [VM opcode "),
+        ("IntegerToken", "0x1e"),
+        ("CommentToken", ", table 1]"),
+    )
+    check(
+        "a number inside a comment is not an operand",
+        align.instruction_text(real).strip() == "adrp    x15, 0x453000",
+        repr(align.instruction_text(real)),
+    )
+    wrapped = Line(
+        ("CommentToken", "// variant of op23 [VM opcode "),
+        ("IntegerToken", "0x1e"),
+        ("CommentToken", ", table 1]"),
+    )
+    check(
+        "nor on a wrapped comment line",
+        align.instruction_text(wrapped) == "",
+        repr(align.instruction_text(wrapped)),
+    )
+
+    # Tags are the analysis's notes too: `❓️` for an unresolved stack pointer.
+    tagged = Line(("TagToken", "\u2753\ufe0f"), *mov("x2", "x0").tokens_spec)
+    rows = align.align_lines([tagged], [mov("x2", "x0")])
+    check("a tag is not code", rows[0].status is LineStatus.EQUAL, f"{rows[0].status}")
 
     # Without tokens only a leading `//` is trusted.
     check("text-only comment lines go too", align.instruction_text("  // note") == "")

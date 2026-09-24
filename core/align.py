@@ -287,8 +287,14 @@ def _tokens_of(line):
     return getattr(target, "tokens", None)
 
 
+#: Tags are about the code rather than part of it, and include the analysis's
+#: own warnings (`❓️` for an unresolved stack pointer), which one database has
+#: and another of the same bytes does not.
+_NOT_CODE = {InstructionTextTokenType.TagToken}
+
+
 def instruction_tokens(line):
-    """A line's tokens with annotations — braces and contents — and comments removed.
+    """A line's tokens with annotations — braces and contents — comments and tags removed.
 
     Comments are the user's notes, not the code: a function someone has
     annotated is the same function, and reporting it as changed is exactly the
@@ -303,6 +309,12 @@ def instruction_tokens(line):
     kept, depth = [], 0
     for token in tokens:
         if token.type == InstructionTextTokenType.CommentToken:
+            # A comment runs to the end of the line, and only its prose is typed
+            # as one: the renderer highlights numbers inside it, so
+            # `// [VM opcode 0x1e, table 1]` carries an IntegerToken that would
+            # otherwise be read as an operand.
+            break
+        if token.type in _NOT_CODE:
             continue
         if token.type == InstructionTextTokenType.AnnotationToken:
             depth += token.text.count("{") - token.text.count("}")
@@ -386,6 +398,77 @@ def resolved_symbol_only(left, right) -> bool:
     )
 
 
+def _spells_its_address(token) -> bool:
+    """Whether a token prints nothing but the address it stands for.
+
+    A bare number, or a placeholder such as `sub_453694` that encodes it; either
+    way the view had no name for the target.
+    """
+
+    if token.type in _UNRESOLVED_TOKENS:
+        return True
+    match = _ADDRESS_NAME.fullmatch(token.text.strip())
+    return (
+        token.type in _SYMBOL_TOKENS
+        and match is not None
+        and int(match.group(1), 16) == token.value
+    )
+
+
+def _operand_tokens(line):
+    """:func:`instruction_tokens`, with a symbol's `[index]` or `+offset` folded in.
+
+    A view that defined a variable spells an address inside it as that variable
+    plus an index — `s_data_data[1]` where the other has `data_591000` — and the
+    symbol token's value is already the address meant, index included. Folding
+    the suffix lets the two be compared as the one operand they are; the value
+    comparison in :func:`resolved_same_target` is what makes that safe.
+    """
+
+    tokens = instruction_tokens(line)
+    if not tokens:
+        return tokens
+    kept, index = [], 0
+    while index < len(tokens):
+        token = tokens[index]
+        kept.append(token)
+        index += 1
+        if token.type not in _SYMBOL_TOKENS:
+            continue
+        texts = [t.text.strip() for t in tokens[index : index + 3]]
+        if texts[:1] == ["["] and texts[2:3] == ["]"]:
+            index += 3
+        elif texts[:1] == ["+"] and len(texts) > 1:
+            index += 2
+    return kept
+
+
+def resolved_same_target(left, right) -> bool:
+    """Whether every difference is one side naming the address the other printed.
+
+    :func:`resolved_symbol_only` only knows that a name stands where an address
+    does. The tokens say more: a symbol token carries the address it names, so
+    `bl 0x431970` against `bl __stack_chk_fail` whose value is 0x431970 is the
+    same call, and so is `bl sub_453694` against a `bl vm_interp_dispatch` the
+    user renamed on one side only — the usual state of an annotated database
+    against a fresh build. This is :func:`compare_line`'s `sub_...` rule for
+    names that do not spell their address; a target that *moved* still comes
+    out `~`, and two different real names are still a change.
+    """
+
+    left_tokens, right_tokens = _operand_tokens(left), _operand_tokens(right)
+    if not left_tokens or not right_tokens or len(left_tokens) != len(right_tokens):
+        return False
+    differing = [(a, b) for a, b in zip(left_tokens, right_tokens, strict=True) if a.text != b.text]
+    return bool(differing) and all(
+        a.value
+        and a.value == b.value
+        and _spells_its_address(a) != _spells_its_address(b)
+        and {a.type, b.type} & _SYMBOL_TOKENS
+        for a, b in differing
+    )
+
+
 def shape_signature(line) -> str | None:
     """What the instruction *does*, with register and literal names erased.
 
@@ -464,18 +547,26 @@ def ensure_il(func: BNFunction, level: str):
     because ``il_basic_blocks`` reads ``func.llil`` and generates the IL as a
     side effect — this is that same generation, done where it is needed.
 
+    Disassembly needs it too, though it is not IL: the core resolves call
+    targets and appends ``{var_...}`` only while the function's LLIL exists, and
+    evicts that from its analysis cache (``analysis.limits.cacheSize``) for
+    functions nobody has looked at. Unasked, three calls in four came out as
+    `bl 0x431970` rather than `bl __stack_chk_fail`, on whichever side the
+    cache happened to have dropped, and every one of them read as a difference.
+
     Returns the IL function, or ``None`` when there is none to generate.
     """
 
-    attribute = _IL_PROPERTY.get(level)
+    attribute = "llil" if level == "Disassembly" else _IL_PROPERTY.get(level)
     if attribute is None:
         return None
     try:
-        return getattr(func, attribute)
+        il = getattr(func, attribute)
     except Exception:
         # A function whose analysis was skipped has no IL and never will; the
         # linear view says so itself, which beats refusing to render.
         return None
+    return None if level == "Disassembly" else il
 
 
 def ensure_rendering(func: BNFunction, level: str | RenderLevel) -> None:
@@ -530,6 +621,7 @@ def il_basic_blocks(func: BNFunction, level: str):
     """
 
     if level == "Disassembly":
+        ensure_il(func, level)
         return list(func.basic_blocks)
     il = ensure_il(func, level)
     if il is None:
@@ -734,11 +826,15 @@ def _greedy_text_match(
 
 
 def _blocks_identical(left_block, right_block) -> bool:
-    # Conservative comparison, so a block differing only by an immediate is
-    # reported as changed rather than identical.
-    left = [compare_line(t) for t in block_text(left_block)]
-    right = [compare_line(t) for t in block_text(right_block)]
-    return left == right
+    """Whether two blocks read the same, by the rules the lines are graded on.
+
+    Anything looser than :func:`align_lines` lets a block be called changed
+    while none of its lines is, and the graph then reports a change it has
+    nothing to tint for; anything stricter hides an immediate that changed.
+    """
+
+    rows = align_lines(list(left_block.disassembly_text), list(right_block.disassembly_text))
+    return classify_rows(rows) is FunctionStatus.IDENTICAL
 
 
 # --------------------------------------------------------------------------
@@ -774,6 +870,8 @@ def align_lines(
         if left_text == right_text:
             return LineStatus.EQUAL
         if compare_line(left_text) == compare_line(right_text):
+            return LineStatus.EQUAL
+        if resolved_same_target(left, right):
             return LineStatus.EQUAL
         left_norm, right_norm = normalize_line(left_text), normalize_line(right_text)
         if left_norm == right_norm:

@@ -229,6 +229,15 @@ it: `il_basic_blocks` touches those same properties. A language representation
 is generated separately on top of HLIL, so `ensure_rendering()` also asks for
 `func.language_representation(name)`; use it wherever a `RenderLevel` is drawn.
 
+**Disassembly needs the LLIL too.** Without it the core renders call targets as
+bare addresses (`bl 0x431970`, not `bl __stack_chk_fail`) and drops every
+`{var_...}` annotation — and it evicts LLIL from its analysis cache
+(`analysis.limits.cacheSize`) for functions nobody looked at, so on a real
+5.5k-function pair three calls in four rendered that way, on whichever side the
+cache had dropped. Nothing errors; the diff just fills with differences that
+clicking through to the function does not show. `ensure_il(func, "Disassembly")`
+reads `func.llil` for that reason and still returns `None`.
+
 **`palette(mid)` is unreadable in Binary Ninja's dark themes.** It is Qt's
 answer for muted text, and there `mid` sits a shade off the window color, so
 dimmed labels render near-black on near-black — no error, just an unreadable
@@ -665,6 +674,21 @@ function calling a helper that moved was reported *identical* while the two
 panes plainly showed different text. Anything the reader can see has to be at
 least `~`; only `normalize_line` may fold it. Note `call memcpy` against
 `call malloc` stays `CHANGED` — a real name is not an address.
+
+The one name that *is* an address is one whose token proves it:
+`align.resolved_same_target()` grades `EQUAL` when every difference is one side
+spelling an address (`0x431970`, `sub_453694`) and the other a symbol token whose
+`.value` is that same address (`__stack_chk_fail`, a callee the user renamed, or
+`s_data_data[1]` — the index is folded, the value already includes it). It is
+the `compare_line` rule for names that do not encode their address, and the
+common case of an annotated database against a fresh build. Comments and tags
+(`CommentToken`, `TagToken`, including the analysis's own `❓️` warnings) never
+reach any of this: `instruction_tokens` drops them, and a line left empty is
+`LineStatus.COMMENT`, shown but not compared. A comment is dropped from its
+first `CommentToken` to the end of the line, not token by token: the renderer
+types numbers inside the prose as `IntegerToken` (`// [VM opcode 0x1e]`), and
+filtering by type alone left 76 functions of one real pair "changed" by a
+number in a comment.
 
 The three-way outcome is:
 
