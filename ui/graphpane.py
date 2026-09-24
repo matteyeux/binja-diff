@@ -32,14 +32,20 @@ from ..core.align import (
     BlockAlignment,
     BlockStatus,
     RenderLevel,
+    address_pairs,
     align_blocks,
     LineStatus,
     align_line_statuses,
+    align_lines,
     ensure_rendering,
+    format_block_summary,
+    function_instruction_lines,
     il_basic_blocks,
+    summarize_blocks,
 )
 from . import theme
 from .background import LatestOnly
+from .cursorsync import CursorSync
 from .levelpicker import LevelPicker
 
 
@@ -116,6 +122,20 @@ class GraphPane(QWidget):
     def set_title(self, text: str) -> None:
         self.title.setText(text)
 
+    def show_address(self, address: int) -> None:
+        """Put the cursor on ``address`` in the graph on screen, centred.
+
+        Not ``navigate``: that is navigation proper — history, and a lookup of
+        the function at the address — and these graphs are ours, built by
+        ``create_graph``, so it left the cursor where it was.
+        """
+
+        show = getattr(self.graph, "showAddress", None)
+        if show is not None:
+            show(address, True, True)
+        else:
+            self.graph.navigate(address)
+
     def show_graph(self, graph) -> None:
         self.graph.setGraph(graph)
 
@@ -134,6 +154,11 @@ class GraphDiffTab(QWidget):
         self._renderer = LatestOnly("Rendering the graph diff")
         self._left_func = None
         self._right_func = None
+        self.sync = CursorSync(
+            self,
+            lambda side: self._pane(side).graph.getCurrentOffset(),
+            lambda side, address: self._pane(side).show_address(address),
+        )
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -150,14 +175,11 @@ class GraphDiffTab(QWidget):
         for label, color in theme.graph_line_legend():
             header.addWidget(self._swatch(label, color))
 
-        header.addSpacing(12)
-        for label, color in theme.block_legend():
-            header.addWidget(self._swatch(label, color))
-
         self.summary = QLabel("", self)
         header.addSpacing(16)
         header.addWidget(self.summary)
         header.addStretch(1)
+        header.addWidget(self.sync.button)
         layout.addLayout(header)
 
         self.splitter = QSplitter(Qt.Horizontal, self)
@@ -184,6 +206,9 @@ class GraphDiffTab(QWidget):
     def level(self) -> RenderLevel:
         return self.level_combo.level
 
+    def _pane(self, side: str) -> GraphPane:
+        return self.left if side == "left" else self.right
+
     def set_views(self, left_bv, right_bv) -> None:
         """Rebuild the graph widgets; they bind a BinaryView at construction."""
 
@@ -191,11 +216,13 @@ class GraphDiffTab(QWidget):
         self.left.setParent(None)
         self.left = GraphPane(self.splitter, left_bv, "Primary")
         self.splitter.insertWidget(index, self.left)
+        self.sync.watch(self.left.graph, "left")
 
         index = self.splitter.indexOf(self.right)
         self.right.setParent(None)
         self.right = GraphPane(self.splitter, right_bv, "Secondary")
         self.splitter.insertWidget(index, self.right)
+        self.sync.watch(self.right.graph, "right")
         self.splitter.setSizes([1, 1])
 
     def show_pair(self, left_func, right_func) -> None:
@@ -215,7 +242,8 @@ class GraphDiffTab(QWidget):
         self.splitter.setEnabled(False)
 
         def deliver(rendered) -> None:
-            left_graph, right_graph, summary = rendered
+            left_graph, right_graph, summary, pairs = rendered
+            self.sync.set_pairs(pairs)
             self.summary.setText(summary)
             self.left.show_graph(left_graph)
             self.right.show_graph(right_graph)
@@ -246,6 +274,7 @@ class GraphDiffTab(QWidget):
 
     def clear(self) -> None:
         self._renderer.cancel()
+        self.sync.set_pairs([])
         self._left_func = None
         self._right_func = None
         self.splitter.setEnabled(True)
@@ -262,21 +291,21 @@ def render_pair(left_func, right_func, level: RenderLevel, colors: dict):
     Runs on a worker thread: it touches Binary Ninja, never Qt.
     """
 
+    left_blocks = il_basic_blocks(left_func, level.level) if left_func is not None else []
+    right_blocks = il_basic_blocks(right_func, level.level) if right_func is not None else []
     if left_func is not None and right_func is not None:
         alignment = align_blocks(left_func, right_func, level.level)
-        counts: dict[str, int] = {}
-        for status in alignment.left_status.values():
-            counts[status.value] = counts.get(status.value, 0) + 1
-        summary = "  ".join(f"{name}: {count}" for name, count in sorted(counts.items()))
+        counts = summarize_blocks(alignment, left_blocks, right_blocks)
     else:
         alignment = BlockAlignment()
-        summary = ""
+        counts = {"only in primary": len(left_blocks), "only in secondary": len(right_blocks)}
+    summary = format_block_summary(counts)
 
     left_graph, left_nodes = build_graph(left_func, level)
     right_graph, right_nodes = build_graph(right_func, level)
 
-    _color_nodes(left_nodes, alignment.left_status or _unmatched(left_func, level))
-    _color_nodes(right_nodes, alignment.right_status or _unmatched(right_func, level))
+    _color_nodes(left_nodes, alignment.left_status or _unmatched(left_func, level), "left")
+    _color_nodes(right_nodes, alignment.right_status or _unmatched(right_func, level), "right")
     if left_func is not None and right_func is not None:
         _mark_changed_lines(alignment, left_nodes, right_nodes, colors)
 
@@ -285,7 +314,16 @@ def render_pair(left_func, right_func, level: RenderLevel, colors: dict):
     for graph in (left_graph, right_graph):
         if graph is not None:
             graph.layout_and_wait()
-    return left_graph, right_graph, summary
+    # What following the cursor across the two graphs goes by.
+    pairs = []
+    if left_func is not None and right_func is not None:
+        pairs = address_pairs(
+            align_lines(
+                function_instruction_lines(left_func, level.level),
+                function_instruction_lines(right_func, level.level),
+            )
+        )
+    return left_graph, right_graph, summary, pairs
 
 
 def _unmatched(func, level: RenderLevel) -> dict[int, BlockStatus]:
@@ -294,7 +332,7 @@ def _unmatched(func, level: RenderLevel) -> dict[int, BlockStatus]:
     return {b.start: BlockStatus.UNMATCHED for b in il_basic_blocks(func, level.level)}
 
 
-def _color_nodes(nodes, statuses: dict[int, BlockStatus]) -> None:
+def _color_nodes(nodes, statuses: dict[int, BlockStatus], side: str) -> None:
     """Tint whole nodes only where the whole block is the story.
 
     ``block_highlight`` returns ``None`` for identical blocks (the common
@@ -306,7 +344,7 @@ def _color_nodes(nodes, statuses: dict[int, BlockStatus]) -> None:
         node = nodes.get(addr)
         if node is None:
             continue
-        color = theme.block_highlight(status)
+        color = theme.block_highlight(status, side)
         if color is not None:
             node.highlight = color
 

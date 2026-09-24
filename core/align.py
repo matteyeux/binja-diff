@@ -274,8 +274,16 @@ _SHAPE_PLACEHOLDER = {
 # different control/key registers look like a harmless register rename. The
 # set describes instruction semantics, not a particular firmware or register.
 _STATE_REGISTER_MNEMONICS = {
-    "msr", "mrs",  # ARM system registers
-    "csrrw", "csrrs", "csrrc", "csrrwi", "csrrsi", "csrrci",  # RISC-V CSRs
+    # ARM system registers
+    "msr",
+    "mrs",
+    # RISC-V CSRs
+    "csrrw",
+    "csrrs",
+    "csrrc",
+    "csrrwi",
+    "csrrsi",
+    "csrrci",
 }
 
 
@@ -290,7 +298,13 @@ def _tokens_of(line):
 #: Tags are about the code rather than part of it, and include the analysis's
 #: own warnings (`❓️` for an unresolved stack pointer), which one database has
 #: and another of the same bytes does not.
-_NOT_CODE = {InstructionTextTokenType.TagToken}
+_NOT_CODE = {
+    InstructionTextTokenType.TagToken,
+    # Opcode bytes sit after the address separator, but they are margin too:
+    # shown or not by the reader's settings, and the text beside them says the
+    # same thing.
+    InstructionTextTokenType.OpcodeToken,
+}
 
 
 def instruction_tokens(line):
@@ -306,6 +320,19 @@ def instruction_tokens(line):
     tokens = _tokens_of(line)
     if not tokens:
         return None
+    # Everything before the separator is the line's margin — the address
+    # column, opcode bytes, tags — present or not depending on the reader's
+    # settings. `100000614  _fprintf(...)` and `_fprintf(...)` are one line.
+    separator = next(
+        (
+            index
+            for index, token in enumerate(tokens)
+            if token.type == InstructionTextTokenType.AddressSeparatorToken
+        ),
+        None,
+    )
+    if separator is not None:
+        tokens = tokens[separator + 1 :]
     kept, depth = [], 0
     for token in tokens:
         if token.type == InstructionTextTokenType.CommentToken:
@@ -837,6 +864,52 @@ def _blocks_identical(left_block, right_block) -> bool:
     return classify_rows(rows) is FunctionStatus.IDENTICAL
 
 
+#: Block counts, in the order a summary reads them.
+BLOCK_SUMMARY_KEYS = (
+    "identical",
+    "operands only",
+    "changed",
+    "only in primary",
+    "only in secondary",
+)
+
+
+def summarize_blocks(alignment: BlockAlignment, left_blocks, right_blocks) -> dict[str, int]:
+    """How many blocks of a pair are identical, changed, or on one side only.
+
+    Both sides count: a block only the secondary has is as much a part of the
+    diff as one only the primary has. A matched block that differs only in its
+    operands is kept apart from one that really changed, by the same grading
+    the lines get, so the count agrees with the colours inside the nodes.
+    """
+
+    left_by_addr = {block.start: block for block in left_blocks}
+    right_by_addr = {block.start: block for block in right_blocks}
+    counts = dict.fromkeys(BLOCK_SUMMARY_KEYS, 0)
+    for pair in alignment.pairs:
+        if pair.left_addr is None:
+            counts["only in secondary"] += 1
+        elif pair.right_addr is None:
+            counts["only in primary"] += 1
+        elif pair.status is BlockStatus.IDENTICAL:
+            counts["identical"] += 1
+        else:
+            rows = align_lines(
+                list(left_by_addr[pair.left_addr].disassembly_text),
+                list(right_by_addr[pair.right_addr].disassembly_text),
+            )
+            minor = classify_rows(rows) is FunctionStatus.MINOR
+            counts["operands only" if minor else "changed"] += 1
+    return counts
+
+
+def format_block_summary(counts: dict[str, int]) -> str:
+    """``blocks: 3 identical · 1 changed``, leaving out what there is none of."""
+
+    parts = [f"{counts[key]} {key}" for key in BLOCK_SUMMARY_KEYS if counts.get(key)]
+    return "blocks: " + " \u00b7 ".join(parts) if parts else ""
+
+
 # --------------------------------------------------------------------------
 # Line alignment
 # --------------------------------------------------------------------------
@@ -984,6 +1057,42 @@ def line_address(line) -> int | None:
     contents = getattr(line, "contents", None)
     address = getattr(contents if contents is not None else line, "address", None)
     return address if isinstance(address, int) else None
+
+
+def address_pairs(rows: Iterable[AlignedRow]) -> list[tuple[int, int]]:
+    """``(left, right)`` addresses of every row that has a line on both sides.
+
+    What "the same place on the other side" means, for following a cursor.
+    """
+
+    pairs = []
+    for row in rows:
+        if row.left is None or row.right is None:
+            continue
+        left, right = line_address(row.left), line_address(row.right)
+        if left is not None and right is not None:
+            pairs.append((left, right))
+    return pairs
+
+
+def counterpart(pairs: Sequence[tuple[int, int]], address: int, from_left: bool) -> int | None:
+    """Where ``address`` on one side sits on the other, or ``None`` with no pairs.
+
+    An exact match wins — the first, since one address renders as several
+    lines at the IL levels and the first is where it starts. Otherwise the
+    nearest address, because a line only one side has (added, removed) is not
+    in any pair, and landing next to where it would be beats not moving.
+    """
+
+    here, there = (0, 1) if from_left else (1, 0)
+    best, best_distance = None, None
+    for pair in pairs:
+        distance = abs(pair[here] - address)
+        if distance == 0:
+            return pair[there]
+        if best_distance is None or distance < best_distance:
+            best, best_distance = pair[there], distance
+    return best
 
 
 def anchor_row(rows: Sequence[AlignedRow], address: int) -> int:

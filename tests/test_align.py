@@ -514,6 +514,60 @@ def test_markers():
     )
 
 
+def test_block_summary():
+    """The graph's block count reads both sides and keeps operand churn apart."""
+
+    print("block summary")
+
+    common = {
+        0x10: ["push rbp", "mov rbp, rsp"],
+        0x50: ["pop rbp", "ret"],
+    }
+    left = func_with_blocks(
+        "left",
+        {
+            **common,
+            0x20: ["cmp edi, 0x2a", "jle 0x40"],
+            0x30: ["mov eax, ebx", "call memcpy"],
+            0x40: ["nop", "nop", "nop", "nop"],
+        },
+    )
+    right = func_with_blocks(
+        "right",
+        {
+            **common,
+            0x20: ["cmp edi, 0x63", "jle 0x40"],
+            0x30: ["mov eax, ebx", "call malloc"],
+        },
+    )
+    alignment = align.align_blocks(left, right, "Disassembly")
+    counts = align.summarize_blocks(alignment, left.basic_blocks, right.basic_blocks)
+    expected = {
+        "identical": 2,
+        "operands only": 1,
+        "changed": 1,
+        "only in primary": 1,
+        "only in secondary": 0,
+    }
+    check("every kind counted", counts == expected, f"{counts}")
+    # The other way round, the extra block is the secondary's.
+    swapped = align.summarize_blocks(
+        align.align_blocks(right, left, "Disassembly"), right.basic_blocks, left.basic_blocks
+    )
+    check(
+        "a block only the secondary has is counted",
+        swapped["only in secondary"] == 1 and swapped["only in primary"] == 0,
+        f"{swapped}",
+    )
+    text = align.format_block_summary(counts)
+    check("the summary says blocks", text.startswith("blocks: 2 identical"), repr(text))
+    check(
+        "nothing of a kind, nothing said",
+        align.format_block_summary({"identical": 3}) == "blocks: 3 identical",
+    )
+    check("no blocks, no summary", align.format_block_summary({}) == "")
+
+
 def test_block_alignment_cases():
     print("block alignment cases")
 
@@ -923,6 +977,18 @@ def test_comments_are_not_code():
         repr(align.instruction_text(wrapped)),
     )
 
+    # The margin — address column, opcode bytes — depends on the reader's settings.
+    margin = Line(
+        ("AddressDisplayToken", "100000614"),
+        ("AddressSeparatorToken", "  "),
+        *mov("x2", "x0").tokens_spec,
+    )
+    check(
+        "the address column is not code",
+        align.instruction_text(margin) == align.instruction_text(mov("x2", "x0")),
+        repr(align.instruction_text(margin)),
+    )
+
     # Tags are the analysis's notes too: `❓️` for an unresolved stack pointer.
     tagged = Line(("TagToken", "\u2753\ufe0f"), *mov("x2", "x0").tokens_spec)
     rows = align.align_lines([tagged], [mov("x2", "x0")])
@@ -1062,6 +1128,44 @@ def test_render_levels():
     check("an IL level generates no language", func.touched == ["hlil"], f"{func.touched}")
 
 
+def test_cursor_counterpart():
+    """Clicking a line on one side finds the matching line on the other.
+
+    Only rows with a line on both sides can pair two addresses; a line only one
+    side has lands next to where it would have been, rather than nowhere.
+    """
+
+    print("cursor counterpart")
+
+    class Line:
+        def __init__(self, address):
+            self.address = address
+
+    rows = [
+        align.AlignedRow(Line(0x1000), Line(0x2000), align.LineStatus.EQUAL),
+        align.AlignedRow(Line(0x1004), None, align.LineStatus.REMOVED),
+        align.AlignedRow(Line(0x1008), Line(0x200C), align.LineStatus.MINOR),
+        align.AlignedRow(None, Line(0x2010), align.LineStatus.ADDED),
+        align.AlignedRow(Line(0x1008), Line(0x2014), align.LineStatus.EQUAL),
+    ]
+    pairs = align.address_pairs(rows)
+    check(
+        "only rows with both sides pair",
+        pairs == [(0x1000, 0x2000), (0x1008, 0x200C), (0x1008, 0x2014)],
+    )
+    check("left to right", align.counterpart(pairs, 0x1000, from_left=True) == 0x2000)
+    check("right to left", align.counterpart(pairs, 0x200C, from_left=False) == 0x1008)
+    check(
+        "an address on several lines goes to where it starts",
+        align.counterpart(pairs, 0x1008, from_left=True) == 0x200C,
+    )
+    check(
+        "a line only this side has lands on the nearest pair",
+        align.counterpart(pairs, 0x1004, from_left=True) in (0x2000, 0x200C),
+    )
+    check("no pairs, nowhere to go", align.counterpart([], 0x1000, from_left=True) is None)
+
+
 def test_anchor_row():
     """Switching views keeps the reader's place by address.
 
@@ -1136,11 +1240,13 @@ def main() -> int:
         test_il_is_generated_before_rendering,
         test_render_levels,
         test_anchor_row,
+        test_cursor_counterpart,
         test_repeated_edit_pattern,
         test_shape_signature,
         test_side_statuses,
         test_markers,
         test_block_alignment_cases,
+        test_block_summary,
         test_disjoint_functions,
     ):
         test()

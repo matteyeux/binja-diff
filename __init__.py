@@ -85,7 +85,14 @@ def _register_ui() -> None:
 
     from binaryninjaui import Menu, UIAction, UIActionHandler, ViewType
 
+    from .ui import difflayer
     from .ui.diffview import DiffViewType
+
+    try:
+        difflayer.register()
+    except Exception as exc:
+        # The Linear tab falls back to its own text rendering without it.
+        log_warn(f"binja-diff could not register its render layer: {exc}", "binja-diff")
 
     _view_type = DiffViewType()
     ViewType.registerViewType(_view_type)

@@ -431,13 +431,15 @@ class MatchTableModel(QAbstractTableModel):
                 if not row.is_matched:
                     return row.kind.value
                 status = self.status_of(row)
-                warning = " · verify pair" if align.pairing_needs_review(
-                    row.similarity, self.line_similarity_of(row)
-                ) else ""
+                warning = (
+                    " · verify pair"
+                    if align.pairing_needs_review(row.similarity, self.line_similarity_of(row))
+                    else ""
+                )
                 if status is FunctionStatus.CHANGED:
                     count = self.pattern_count_of(row)
                     if count > 1:
-                        return f"{status.value} · {count}×{warning}"
+                        return f"{status.value} · {count}\u00d7{warning}"
                 return (status.value if status is not None else RowKind.MATCHED.value) + warning
 
         # Sort on the raw values so numeric columns order correctly. The status

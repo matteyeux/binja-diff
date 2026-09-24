@@ -282,8 +282,13 @@ def test_name_anchor_pass():
     sim = np.full((len(p_map), len(s_map)), -1, dtype=np.float32)
 
     engine.match_named_functions(
-        sim, primary, secondary, p_map, s_map,
-        primary_bv=primary_bv, secondary_bv=secondary_bv,
+        sim,
+        primary,
+        secondary,
+        p_map,
+        s_map,
+        primary_bv=primary_bv,
+        secondary_bv=secondary_bv,
     )
 
     alpha_row = sim[p_map[0x1000]]
@@ -312,8 +317,13 @@ def test_exact_code_anchor_and_bad_name():
     s_map = {addr: i for i, (addr, _) in enumerate(secondary.items())}
     sim = np.full((2, 2), -1, dtype=np.float32)
     engine.match_named_functions(
-        sim, primary, secondary, p_map, s_map,
-        primary_bv=primary_bv, secondary_bv=secondary_bv,
+        sim,
+        primary,
+        secondary,
+        p_map,
+        s_map,
+        primary_bv=primary_bv,
+        secondary_bv=secondary_bv,
     )
     check("unique code pairs across addresses", sim[p_map[0x1000], s_map[0x2000]] == 1)
     check("other unique code pair", sim[p_map[0x2000], s_map[0x1000]] == 1)
@@ -327,8 +337,13 @@ def test_exact_code_anchor_and_bad_name():
     secondary = Program.from_backend(ProgramBackendBinja(secondary_bv))
     sim = np.full((1, 1), 0.1, dtype=np.float32)
     engine.match_named_functions(
-        sim, primary, secondary, {0x1000: 0}, {0x2000: 0},
-        primary_bv=primary_bv, secondary_bv=secondary_bv,
+        sim,
+        primary,
+        secondary,
+        {0x1000: 0},
+        {0x2000: 0},
+        primary_bv=primary_bv,
+        secondary_bv=secondary_bv,
     )
     check("incompatible same-name functions not pinned", np.isclose(sim[0, 0], 0.1))
 
@@ -336,8 +351,13 @@ def test_exact_code_anchor_and_bad_name():
     secondary = Program.from_backend(ProgramBackendBinja(secondary_bv))
     sim = np.full((1, 1), 0.9, dtype=np.float32)
     engine.match_named_functions(
-        sim, primary, secondary, {0x1000: 0}, {0x2000: 0},
-        primary_bv=primary_bv, secondary_bv=secondary_bv,
+        sim,
+        primary,
+        secondary,
+        {0x1000: 0},
+        {0x2000: 0},
+        primary_bv=primary_bv,
+        secondary_bv=secondary_bv,
     )
     check("high feature score cannot pin unrelated code", np.isclose(sim[0, 0], 0.9))
 
@@ -347,12 +367,14 @@ def test_weak_pair_demoted_only_with_local_contradiction():
     from binja_diff.core import engine
 
     landmarks = {(0x1000, 0x1100), (0x2000, 0x2100)}
-    check("distant match contradicts exact neighbors", engine.far_from_local_anchors(
-        0x1800, 0x9000, sorted(landmarks)
-    ))
-    check("nearby rewrite stays plausible", not engine.far_from_local_anchors(
-        0x1900, 0x2000, sorted(landmarks)
-    ))
+    check(
+        "distant match contradicts exact neighbors",
+        engine.far_from_local_anchors(0x1800, 0x9000, sorted(landmarks)),
+    )
+    check(
+        "nearby rewrite stays plausible",
+        not engine.far_from_local_anchors(0x1900, 0x2000, sorted(landmarks)),
+    )
 
     primary_bv = build_named_view("primary", {0x1800: "sub_1800", 0x1900: "sub_1900"})
     secondary_bv = build_named_view("secondary", {0x9000: "sub_9000", 0x2000: "sub_2000"})
@@ -361,21 +383,29 @@ def test_weak_pair_demoted_only_with_local_contradiction():
     matches = [
         engine.MatchRecord(
             engine.FunctionRef(0x1800, "sub_1800"),
-            engine.FunctionRef(0x9000, "sub_9000"), 0.0, 0.99,
+            engine.FunctionRef(0x9000, "sub_9000"),
+            0.0,
+            0.99,
         ),
         engine.MatchRecord(
             engine.FunctionRef(0x1900, "sub_1900"),
-            engine.FunctionRef(0x2000, "sub_2000"), 0.0, 0.99,
+            engine.FunctionRef(0x2000, "sub_2000"),
+            0.0,
+            0.99,
         ),
     ]
     result = engine.DiffResult(primary_bv, secondary_bv, 0.9, matches=matches)
     engine.demote_unsubstantiated_matches(result, landmarks)
     check("far unrelated pair demoted", 0x1800 not in result.by_primary)
     check("nearby rewrite remains paired", 0x1900 in result.by_primary)
-    check("both sides become unmatched", (
-        [f.addr for f in result.primary_unmatched],
-        [f.addr for f in result.secondary_unmatched],
-    ) == ([0x1800], [0x9000]))
+    check(
+        "both sides become unmatched",
+        (
+            [f.addr for f in result.primary_unmatched],
+            [f.addr for f in result.secondary_unmatched],
+        )
+        == ([0x1800], [0x9000]),
+    )
 
 
 def test_name_anchor_end_to_end():

@@ -79,11 +79,14 @@ _BLOCK_TINTS = {
     BlockStatus.UNMATCHED: QColor(220, 70, 70),
 }
 
-#: Node-level tints. Only ``UNMATCHED`` gets one: an identical block is the
-#: common case and filling it just adds noise, while a changed block is described
-#: by its own tinted lines rather than by a flat wash over everything.
+#: Node-level tints, per side. Only ``UNMATCHED`` gets one: an identical block
+#: is the common case and filling it just adds noise, while a changed block is
+#: described by its own tinted lines rather than by a flat wash over everything.
+#: A block only the old build has was removed and one only the new build has was
+#: added, so they take the colours of a removed and an added line.
 _BLOCK_HIGHLIGHTS = {
-    BlockStatus.UNMATCHED: HighlightStandardColor.RedHighlightColor,
+    ("left", BlockStatus.UNMATCHED): HighlightStandardColor.RedHighlightColor,
+    ("right", BlockStatus.UNMATCHED): HighlightStandardColor.GreenHighlightColor,
 }
 
 
@@ -141,13 +144,6 @@ def status_tint(status: LineStatus) -> QColor | None:
     return _TINTS.get(status)
 
 
-#: Graph nodes have no room for the gutter markers the text panes use, so color
-#: is the only signal there. Splitting modified instructions into two colors just
-#: asks the reader to decode a distinction they cannot see the key for, so an
-#: operand change reads the same as any other modification.
-_GRAPH_EQUIVALENT = {LineStatus.MINOR: LineStatus.CHANGED}
-
-
 def graph_line_color(status: LineStatus) -> QColor | None:
     """Background for one line of a flow graph node, or ``None`` to leave it be.
 
@@ -155,7 +151,6 @@ def graph_line_color(status: LineStatus) -> QColor | None:
     otherwise untouched block.
     """
 
-    status = _GRAPH_EQUIVALENT.get(status, status)
     tint = _TINTS.get(status)
     if tint is None:
         return None
@@ -175,22 +170,23 @@ def block_color(status: BlockStatus) -> QColor:
     return _blend(background(), _BLOCK_TINTS[status], 0.22)
 
 
-def block_highlight(status: BlockStatus) -> HighlightStandardColor | None:
-    """Whole-node highlight, or ``None`` to leave the node untinted."""
+def block_highlight(status: BlockStatus, side: str) -> HighlightStandardColor | None:
+    """Whole-node highlight for the pane on ``side``, or ``None`` to leave it be."""
 
-    return _BLOCK_HIGHLIGHTS.get(status)
-
-
-def block_legend() -> list[tuple[str, QColor]]:
-    """Whole-node states worth a color. Identical blocks are left plain."""
-
-    return [("block only here", block_color(BlockStatus.UNMATCHED))]
+    return _BLOCK_HIGHLIGHTS.get((side, status))
 
 
 def graph_line_legend() -> list[tuple[str, QColor | None]]:
-    """Line states inside a matched block, as rendered in the graph."""
+    """Line states, as rendered in the graph.
+
+    The same four as the text panes, in the same colours: a graph and a linear
+    view of one pair should not disagree about what a line is. A block only one
+    side has is filled with the added or removed colour, so it needs no entry
+    of its own.
+    """
 
     return [
+        ("operands", graph_line_color(LineStatus.MINOR)),
         ("modified", graph_line_color(LineStatus.CHANGED)),
         ("added", graph_line_color(LineStatus.ADDED)),
         ("removed", graph_line_color(LineStatus.REMOVED)),

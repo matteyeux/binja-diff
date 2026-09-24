@@ -16,7 +16,7 @@ from dataclasses import replace
 from functools import partial
 
 import binaryninjaui  # must precede PySide6; see ui/__init__
-from binaryninja import execute_on_main_thread, log_error
+from binaryninja import execute_on_main_thread, log_error, log_warn
 from binaryninjaui import UIActionHandler, View, ViewFrame, ViewType
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
@@ -44,6 +44,7 @@ from .matchtable import MatchTable
 from .progresspanel import ProgressPanel
 from .scopedialog import ScopeDialog
 from .textpane import TextDiffTab
+from . import difflayer, nativelinear
 
 #: Stack pages.
 _PAGE_DROP, _PAGE_BUSY, _PAGE_RESULTS = 0, 1, 2
@@ -188,6 +189,25 @@ class DiffView(QWidget, View):
 
     # -- construction ------------------------------------------------------
 
+    def _build_linear_tab(self):
+        """The native linear view where this Binary Ninja can host it.
+
+        The text rendering stays as the fallback: it has none of the native
+        view's interaction, but it needs nothing beyond PySide.
+        """
+
+        if nativelinear.available() and difflayer.is_registered():
+            try:
+                return nativelinear.NativeLinearTab(self.tabs)
+            except Exception as exc:
+                log_warn(f"Native linear diff unavailable, using text: {exc}", "QBinDiff")
+        return TextDiffTab(self.tabs)
+
+    def _release_linear_views(self) -> None:
+        release = getattr(self.text_tab, "release_views", None)
+        if release is not None:
+            release()
+
     def _primary_name(self) -> str | None:
         return self.data.file.filename if self.data is not None else None
 
@@ -285,7 +305,7 @@ class DiffView(QWidget, View):
         # One tab per layout; each picks its IL level or language itself.
         self.graph_tab = GraphDiffTab(self.tabs)
         self.tabs.addTab(self.graph_tab, "Graph")
-        self.text_tab = TextDiffTab(self.tabs)
+        self.text_tab = self._build_linear_tab()
         self.tabs.addTab(self.text_tab, "Linear")
         self.tabs.currentChanged.connect(lambda _index: self._refresh_current_tab())
         splitter.addWidget(self.tabs)
@@ -416,6 +436,9 @@ class DiffView(QWidget, View):
         self.close_button.setEnabled(self._owns_secondary)
 
         self.graph_tab.set_views(result.primary_bv, result.secondary_bv)
+        set_views = getattr(self.text_tab, "set_views", None)
+        if set_views is not None:
+            set_views(result.primary_bv, result.secondary_bv)
         self.table.set_result(result)
         self.stack.setCurrentIndex(_PAGE_RESULTS)
 
@@ -427,6 +450,7 @@ class DiffView(QWidget, View):
         self.table.set_result(None)
         self.graph_tab.clear()
         self.text_tab.clear()
+        self._release_linear_views()
 
     def _reset_to_dropzone(self, status: str) -> None:
         self._finish_task()
@@ -461,6 +485,8 @@ class DiffView(QWidget, View):
 
         if self.secondary_bv is not None and self._owns_secondary:
             _stop_workers(self._owned.get("workers", ()))
+            # A native linear view listens to the view it holds.
+            self._release_linear_views()
             _close_secondary(self.secondary_bv)
         self._owned["bv"] = None
         self.secondary_bv = None

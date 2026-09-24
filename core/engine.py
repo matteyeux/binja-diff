@@ -254,9 +254,12 @@ def match_named_functions(
             continue
         if feature_score >= 0.75 and size_ratio >= 0.8:
             left_quick, right_quick = quick_lines(0, left_addr), quick_lines(1, right_addr)
-            if left_quick and right_quick and difflib.SequenceMatcher(
-                None, left_quick, right_quick, autojunk=False
-            ).ratio() >= 0.8:
+            if (
+                left_quick
+                and right_quick
+                and difflib.SequenceMatcher(None, left_quick, right_quick, autojunk=False).ratio()
+                >= 0.8
+            ):
                 named.append((row, col))
                 continue
         left_lines, right_lines = lines(0, left_addr), lines(1, right_addr)
@@ -309,8 +312,7 @@ def demote_unsubstantiated_matches(result: DiffResult, exact_pairs: set[tuple[in
     removed: list[MatchRecord] = []
     for match in result.matches:
         if match.similarity >= 0.05 or (
-            match.primary.name == match.secondary.name
-            and not is_generated_name(match.primary.name)
+            match.primary.name == match.secondary.name and not is_generated_name(match.primary.name)
         ):
             kept.append(match)
             continue

@@ -809,7 +809,52 @@ a difference — a two-line source change repainted the whole function. Two buil
 of the same source agree far more on what instructions say than on graph shape.
 `test_align.test_block_alignment_cases` pins the loop-body/epilogue case.
 
-### The text panes render themselves, on purpose
+### The Linear tab is Binary Ninja's own view, painted by a render layer
+
+`ui/nativelinear.py` puts two native `LinearView`s side by side —
+`setSingleFunctionView(True)`, `navigateToFunction`, `setILViewType` — so the
+tab has everything a normal linear view has: token highlighting, following a
+call, renaming, commenting. Such a view draws what the core produced and
+cannot be handed a colour, so the diff reaches it through `ui/difflayer.py`, a
+`RenderLayer`. It is **enabled by default**, not switched on per widget:
+`toggleRenderLayer` keeps its state somewhere the headers do not say, and
+calling it for the second pane left that pane uncoloured. Scoping comes from the
+registry instead: the layer only touches functions a diff has registered with
+`set_paint` (keyed by view and function start), and those are unregistered as
+soon as the selection moves on.
+
+Lines are keyed with the margin stripped: `instruction_tokens` drops everything
+before the `AddressSeparatorToken`, which is where the reader's address column
+(`AddressDisplayToken`), opcode bytes and tags sit. With the address column on,
+no key matched, so no padding went in and only lines found by address fallback
+were coloured.
+
+The layer also inserts blank lines opposite lines only the other side has, so
+the two views stay row for row and their scroll bars can be mirrored. Rows are
+aligned from a default-settings rendering and the widget renders with the
+reader's, so lines are matched by `line_key` (address plus instruction text).
+Padding goes before the next line whose key is unique, else after the last one
+that was: a key that repeats (blank lines, mostly) cannot say which occurrence
+it means, and dropping that padding shifts every row below it —
+`test_live.test_diff_layer_keeps_the_sides_aligned` pins it.
+
+A `LinearView` holds its `BinaryView` and listens to it, so `release_views()`
+destroys both widgets before `_release_secondary` closes the view. The text
+rendering below is the fallback, chosen when the bindings lack
+`setSingleFunctionView`, or the layer failed to register.
+
+**Sync** (`ui/cursorsync.py`, in both the Graph and the Linear tab) moves the
+other side to the line matching the one clicked. Neither native widget signals
+a cursor move, so it filters the viewport's clicks and the widget's keys, reads
+`getCurrentOffset()` on the next event-loop turn, and maps the address through
+`align.address_pairs` / `align.counterpart`. Moving the other side produces no
+input event, which is what keeps it from bouncing back. The Graph tab moves the
+other side with `FlowGraphWidget.showAddress(address, select, center)`, not
+`navigate()` or `navigateToFunction()`: its graphs are ours, built by
+`create_graph`, and navigation proper (history, a lookup of the function) left
+the cursor where it was.
+
+### The fallback text panes render themselves, on purpose
 
 `ui/textpane.py` builds a `QTextEdit` instead of using Binary Ninja's
 `TokenizedTextWidget`. That widget has **no per-line background**: the only
@@ -831,22 +876,35 @@ graph widget does render it, which is why the basic block view worked all along.
 
 ### Graph nodes: tint lines, not the whole block
 
-The graph colors differences and nothing else. `block_highlight()` returns a
-color for `UNMATCHED` only and `None` for everything else, so:
+The graph colors differences and nothing else. `block_highlight(status, side)`
+returns a color for `UNMATCHED` only and `None` for everything else, so:
 
 - **identical** blocks are left plain — the common case, and noise if filled;
 - **changed** blocks are left plain too, because the differing instructions are
   tinted individually via `DisassemblyTextLine.highlight` on
   `FlowGraphNode.lines`, which the core stores and the widget renders;
-- **unmatched** blocks are the one whole-block fact worth a fill.
+- **unmatched** blocks are the one whole-block fact worth a fill, and the fill
+  depends on the side: red for a block only the primary has (removed), green
+  for one only the secondary has (added) — the colours of a removed and an
+  added line, and what `core/similarity.py` does too. It used to be red on both
+  sides, so an added block looked like a deleted one.
 
 Callers must treat a `None` from `block_highlight()` as "leave the node alone";
-it is not an error. Graph nodes also have no room for the `~` / `!` markers the
-text panes rely on, so `_GRAPH_EQUIVALENT` folds `MINOR` into `CHANGED` there:
-with no key on screen, two shades of "modified" only ask the reader to decode a
-distinction they cannot see. The text panes keep the tiers apart because the
-markers and legend make them readable, which is why `graph_line_color()` and
-`line_color()` are separate functions rather than one shared table.
+it is not an error. The graph grades lines exactly as the text panes do,
+`MINOR` included, in the same colours and with the same legend entries. It used
+to fold `MINOR` into `CHANGED`, on the grounds that nodes have no room for the
+`~` / `!` markers; but the tab has a legend, and with comments, resolved
+symbols and moved targets graded correctly `~` is now mostly rebase churn —
+painting it as a modification made a function with nothing modified look
+edited, and made the graph disagree with the Linear tab about the same line.
+`graph_line_color()` stays separate from `line_color()` because the graph blends
+against `graph_background()`.
+
+The header's `blocks: 2 identical · 3 operands only · 1 only in secondary` is
+`align.summarize_blocks()`. It counts both sides — it used to read
+`alignment.left_status` alone, so an added block never appeared in it — and
+grades a changed block by `classify_rows` so "operands only" matches the blue
+lines inside the node rather than being counted as a change.
 
 Statuses must be computed from **the node's own lines**, never from
 `BasicBlock.disassembly_text`. A node prepends a symbol label (`main:`) that the

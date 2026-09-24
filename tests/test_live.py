@@ -428,6 +428,81 @@ def test_graph_line_highlighting(result):
     print(f"       {primary.name}: {len(marked)}/{len(lines)} lines highlighted in one block")
 
 
+def test_diff_layer_keeps_the_sides_aligned(result):
+    """The linear tab's render layer must pad and paint real renderings.
+
+    The native linear view renders with the reader's settings, not the ones the
+    diff was aligned with, so the layer matches lines by address and text. Two
+    things are only provable against real output: both sides come out the same
+    length once padded, and what gets painted is exactly the differing lines.
+    """
+
+    print("linear diff render layer")
+    from binaryninja import DisassemblySettings, HighlightColor, LinearViewCursor
+    from binaryninja.enums import DisassemblyOption
+
+    from binja_diff.core import align
+    from binja_diff.ui import difflayer
+
+    if result is None:
+        print("  (no result)")
+        return
+
+    mark = HighlightColor(red=200, green=0, blue=0)
+    gap = HighlightColor(red=1, green=1, blue=1)
+    colors = {s: (mark if s.is_difference else None) for s in align.LineStatus}
+    layer = difflayer.DiffRenderLayer()
+
+    def reader_lines(func):
+        # The widget renders with the reader's settings, which is what the keys
+        # have to survive: an address column and opcode bytes in the margin.
+        settings = DisassemblySettings()
+        settings.set_option(DisassemblyOption.ShowAddress)
+        settings.set_option(DisassemblyOption.ShowOpcode)
+        cursor = LinearViewCursor(align.render_level("Disassembly").linear_object(func, settings))
+        lines = []
+        while chunk := func.view.get_next_linear_disassembly_lines(cursor):
+            lines.extend(chunk)
+        return lines
+
+    tested = 0
+    for match in sorted(result.matches, key=lambda m: m.similarity)[:20]:
+        left = result.primary_bv.get_function_at(match.primary.addr)
+        right = result.secondary_bv.get_function_at(match.secondary.addr)
+        if left is None or right is None:
+            continue
+        rows = align.align_function_text(
+            result.primary_bv, left, result.secondary_bv, right, "Disassembly"
+        )
+        if not any(row.status.is_difference for row in rows):
+            continue
+        statuses = [row.status for row in rows]
+        sides = []
+        for bv, func, column in (
+            (result.primary_bv, left, [r.left for r in rows]),
+            (result.secondary_bv, right, [r.right for r in rows]),
+        ):
+            difflayer.set_paint(bv, func, difflayer.build_paint(column, statuses, colors, gap))
+            sides.append(layer.apply_to_linear_view_object(None, None, None, reader_lines(func)))
+        difflayer.clear_paints()
+        painted = [sum(line.contents.highlight.red == mark.red for line in side) for side in sides]
+        expected = [
+            sum(r.status.is_difference and r.left is not None for r in rows),
+            sum(r.status.is_difference and r.right is not None for r in rows),
+        ]
+        check(
+            f"{left.name}: both sides padded to one length",
+            len(sides[0]) == len(sides[1]),
+            f"{len(sides[0])} vs {len(sides[1])}",
+        )
+        check(f"{left.name}: the differing lines are painted", painted == expected, f"{painted}")
+        tested += 1
+        if tested == 3:
+            break
+    if not tested:
+        print("  (no changed pair to hand)")
+
+
 def test_saved_diff_round_trip(result, primary_path: str):
     """A saved diff must survive the real metadata store and a real .bndb.
 
@@ -837,6 +912,7 @@ def main() -> int:
         test_status_agrees_with_the_panes(result)
         test_changes_are_visible(result)
         test_graph_line_highlighting(result)
+        test_diff_layer_keeps_the_sides_aligned(result)
         test_saved_diff_round_trip(result, primary_path)
         test_kernelcache_scoping()
         test_similarity_provider(primary_path, secondary_path)
