@@ -60,6 +60,7 @@ _TINTS = {
     LineStatus.ADDED: QColor(70, 190, 90),
     LineStatus.REMOVED: QColor(220, 70, 70),
     LineStatus.GAP: QColor(120, 120, 120),
+    LineStatus.COMMENT: None,
 }
 
 #: How strongly each tint is mixed into the background. Differences that matter

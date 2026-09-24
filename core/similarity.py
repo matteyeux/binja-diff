@@ -615,7 +615,11 @@ def _annotations(rows, side: str):
     end_of_last = max(known) + 1
     annotations = []
     for index, (row, address) in enumerate(lines):
-        if address is None or row.status in (align.LineStatus.EQUAL, align.LineStatus.GAP):
+        if address is None or row.status in (
+            align.LineStatus.EQUAL,
+            align.LineStatus.GAP,
+            align.LineStatus.COMMENT,
+        ):
             continue
         following = next(
             (later for _row, later in lines[index + 1 :] if later is not None and later > address),

@@ -47,6 +47,9 @@ class LineStatus(str, Enum):
     REMOVED = "removed"
     #: Padding inserted on one side so both panes stay row-aligned.
     GAP = "gap"
+    #: A line with no code on it — a user comment, a blank line. Shown, never
+    #: compared: annotating a function is not changing it.
+    COMMENT = "comment"
 
     @property
     def marker(self) -> str:
@@ -63,11 +66,12 @@ class LineStatus(str, Enum):
             LineStatus.ADDED: "+",
             LineStatus.REMOVED: "-",
             LineStatus.GAP: " ",
+            LineStatus.COMMENT: " ",
         }[self]
 
     @property
     def is_difference(self) -> bool:
-        return self not in (LineStatus.EQUAL, LineStatus.GAP)
+        return self not in (LineStatus.EQUAL, LineStatus.GAP, LineStatus.COMMENT)
 
 
 class BlockStatus(str, Enum):
@@ -206,6 +210,10 @@ _TRAILING_HINTS = re.compile(r"(?:\s*\{[^{}]*\})+\s*$")
 
 _WS = re.compile(r"\s+")
 
+#: A comment line with no tokens to identify it. Only a *leading* `//` is
+#: trusted: further along a line it may sit inside a string literal.
+_COMMENT_LINE = re.compile(r"^\s*//")
+
 
 def normalize_line(text: str) -> str:
     """Aggressive normalization, used to *align* rows and to grade them MINOR.
@@ -280,7 +288,11 @@ def _tokens_of(line):
 
 
 def instruction_tokens(line):
-    """A line's tokens with annotations — braces and contents — removed.
+    """A line's tokens with annotations — braces and contents — and comments removed.
+
+    Comments are the user's notes, not the code: a function someone has
+    annotated is the same function, and reporting it as changed is exactly the
+    wrong way round for a database compared with the binary it was built from.
 
     ``None`` when the line carries no tokens at all.
     """
@@ -290,6 +302,8 @@ def instruction_tokens(line):
         return None
     kept, depth = [], 0
     for token in tokens:
+        if token.type == InstructionTextTokenType.CommentToken:
+            continue
         if token.type == InstructionTextTokenType.AnnotationToken:
             depth += token.text.count("{") - token.text.count("}")
             continue
@@ -322,7 +336,10 @@ def instruction_text(line, key=str) -> str:
     tokens = instruction_tokens(line)
     if tokens is None:
         # Plain strings and the test stubs: the braces are all there is to go on.
-        return _TRAILING_HINTS.sub("", key(line))
+        text = key(line)
+        if _COMMENT_LINE.match(text):
+            return ""
+        return _TRAILING_HINTS.sub("", text)
     return "".join(token.text for token in tokens)
 
 
@@ -521,7 +538,15 @@ def il_basic_blocks(func: BNFunction, level: str):
 
 
 def block_text(block) -> list[str]:
-    return [str(line) for line in block.disassembly_text]
+    """A block's code, without annotations or comment lines.
+
+    What decides whether two blocks are the same, so it has to ignore what
+    :func:`align_lines` ignores: a block whose only difference is a comment
+    would otherwise be reported changed and have nothing in it tinted.
+    """
+
+    texts = (instruction_text(line) for line in block.disassembly_text)
+    return [text for text in texts if text.strip()]
 
 
 def _block_graph(blocks) -> networkx.DiGraph:
@@ -733,8 +758,12 @@ def align_lines(
     ``__str__``.
     """
 
-    left_keys = [normalize_line(instruction_text(line, key)) for line in left_lines]
-    right_keys = [normalize_line(instruction_text(line, key)) for line in right_lines]
+    # Lines with no code on them take no part in the alignment, or a comment on
+    # one side reads as an added instruction. They are woven back in below.
+    left_code = [i for i, line in enumerate(left_lines) if instruction_text(line, key).strip()]
+    right_code = [i for i, line in enumerate(right_lines) if instruction_text(line, key).strip()]
+    left_keys = [normalize_line(instruction_text(left_lines[i], key)) for i in left_code]
+    right_keys = [normalize_line(instruction_text(right_lines[i], key)) for i in right_code]
 
     def classify(left, right) -> LineStatus:
         """Grade a matched pair, from identical through to structurally different."""
@@ -758,34 +787,52 @@ def align_lines(
             return LineStatus.MINOR
         return LineStatus.CHANGED
 
-    rows: list[AlignedRow] = []
+    pairs: list[tuple[int | None, int | None]] = []
     matcher = difflib.SequenceMatcher(None, left_keys, right_keys, autojunk=False)
     for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-        if tag == "equal":
+        if tag in ("equal", "replace"):
             # Equal under the aggressive key still allows literals to differ,
             # which is exactly the case that used to render as unchanged.
-            for offset in range(i2 - i1):
-                left = left_lines[i1 + offset]
-                right = right_lines[j1 + offset]
-                rows.append(AlignedRow(left, right, classify(left, right)))
-        elif tag == "replace":
-            left_chunk = list(left_lines[i1:i2])
-            right_chunk = list(right_lines[j1:j2])
-            for offset in range(max(len(left_chunk), len(right_chunk))):
-                left = left_chunk[offset] if offset < len(left_chunk) else None
-                right = right_chunk[offset] if offset < len(right_chunk) else None
-                if left is None:
-                    rows.append(AlignedRow(None, right, LineStatus.ADDED))
-                elif right is None:
-                    rows.append(AlignedRow(left, None, LineStatus.REMOVED))
-                else:
-                    rows.append(AlignedRow(left, right, classify(left, right)))
+            for offset in range(max(i2 - i1, j2 - j1)):
+                left = left_code[i1 + offset] if i1 + offset < i2 else None
+                right = right_code[j1 + offset] if j1 + offset < j2 else None
+                pairs.append((left, right))
         elif tag == "delete":
-            for line in left_lines[i1:i2]:
-                rows.append(AlignedRow(line, None, LineStatus.REMOVED))
+            pairs.extend((left_code[i], None) for i in range(i1, i2))
         elif tag == "insert":
-            for line in right_lines[j1:j2]:
-                rows.append(AlignedRow(None, line, LineStatus.ADDED))
+            pairs.extend((None, right_code[j]) for j in range(j1, j2))
+
+    rows: list[AlignedRow] = []
+    next_left = next_right = 0
+
+    def commentary(left_stop: int, right_stop: int) -> None:
+        # Paired up side by side, so a blank line both renderings share stays
+        # one row rather than two.
+        nonlocal next_left, next_right
+        left_notes = left_lines[next_left:left_stop]
+        right_notes = right_lines[next_right:right_stop]
+        for offset in range(max(len(left_notes), len(right_notes))):
+            left = left_notes[offset] if offset < len(left_notes) else None
+            right = right_notes[offset] if offset < len(right_notes) else None
+            rows.append(AlignedRow(left, right, LineStatus.COMMENT))
+        next_left, next_right = max(next_left, left_stop), max(next_right, right_stop)
+
+    for left_index, right_index in pairs:
+        commentary(
+            next_left if left_index is None else left_index,
+            next_right if right_index is None else right_index,
+        )
+        left = None if left_index is None else left_lines[left_index]
+        right = None if right_index is None else right_lines[right_index]
+        if left is None:
+            rows.append(AlignedRow(None, right, LineStatus.ADDED))
+        elif right is None:
+            rows.append(AlignedRow(left, None, LineStatus.REMOVED))
+        else:
+            rows.append(AlignedRow(left, right, classify(left, right)))
+        next_left = next_left if left_index is None else left_index + 1
+        next_right = next_right if right_index is None else right_index + 1
+    commentary(len(left_lines), len(right_lines))
     return rows
 
 
@@ -897,10 +944,10 @@ def _instruction_count(func: BNFunction) -> int:
 def classify_rows(rows: Iterable[AlignedRow]) -> FunctionStatus:
     """Summarize aligned rows into one status for the pair they came from."""
 
-    statuses = {row.status for row in rows}
-    if not statuses - {LineStatus.EQUAL, LineStatus.GAP}:
+    statuses = {row.status for row in rows} - {LineStatus.GAP, LineStatus.COMMENT}
+    if not statuses - {LineStatus.EQUAL}:
         return FunctionStatus.IDENTICAL
-    if not statuses - {LineStatus.EQUAL, LineStatus.GAP, LineStatus.MINOR}:
+    if not statuses - {LineStatus.EQUAL, LineStatus.MINOR}:
         return FunctionStatus.MINOR
     return FunctionStatus.CHANGED
 
@@ -922,7 +969,7 @@ def text_similarity(rows: Iterable[AlignedRow]) -> float:
 
     total = same = 0
     for row in rows:
-        if row.status is LineStatus.GAP:
+        if row.status in (LineStatus.GAP, LineStatus.COMMENT):
             continue
         total += 1
         if row.status in (LineStatus.EQUAL, LineStatus.MINOR):

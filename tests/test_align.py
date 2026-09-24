@@ -722,6 +722,105 @@ def test_annotation_only_lines_are_not_instructions():
     check("and the pair is identical", status is align.FunctionStatus.IDENTICAL, f"{status}")
 
 
+def test_comments_are_not_code():
+    """A function someone commented is the same function.
+
+    Binary Ninja renders a function comment as whole lines of ``CommentToken``
+    above the code, and an address comment on the end of its instruction. Both
+    are the user's notes: a database annotated this way and diffed against the
+    binary it came from read "changed", its comment lines marked removed.
+    """
+
+    print("comments are not code")
+
+    class Line:
+        def __init__(self, *spec):
+            self.tokens = [Token(getattr(TT, kind), text) for kind, text in spec]
+
+        def __str__(self):
+            return "".join(token.text for token in self.tokens)
+
+    def mov(dst: str, src: str, comment: str = ""):
+        spec = [
+            ("InstructionToken", "mov"),
+            ("TextToken", "     "),
+            ("RegisterToken", dst),
+            ("OperandSeparatorToken", ", "),
+            ("RegisterToken", src),
+        ]
+        if comment:
+            spec += [("TextToken", "  "), ("CommentToken", f"// {comment}")]
+        return Line(*spec)
+
+    note = Line(("CommentToken", "// trivial jump(arg1) tail-call stub"))
+    br = Line(("InstructionToken", "br"), ("TextToken", "      "), ("RegisterToken", "x2"))
+
+    check("a comment line carries no code", align.instruction_text(note) == "")
+    check(
+        "an inline comment goes, the instruction stays",
+        align.instruction_text(mov("x2", "x0", "the callback")).strip() == "mov     x2, x0",
+        repr(align.instruction_text(mov("x2", "x0", "the callback"))),
+    )
+
+    commented = [note, note, mov("x2", "x0", "the callback"), mov("x0", "x1"), br]
+    plain = [mov("x2", "x0"), mov("x0", "x1"), br]
+    rows = align.align_lines(commented, plain)
+    check(
+        "comment lines are kept, and marked as such",
+        [row.status for row in rows][:2] == [LineStatus.COMMENT, LineStatus.COMMENT],
+        f"{[row.status.value for row in rows]}",
+    )
+    check(
+        "the code still pairs up",
+        [row.status for row in rows][2:] == [LineStatus.EQUAL] * 3,
+        f"{[row.status.value for row in rows]}",
+    )
+    check(
+        "so the pair is identical",
+        align.classify_rows(rows) is align.FunctionStatus.IDENTICAL,
+        f"{align.classify_rows(rows)}",
+    )
+    similarity = align.text_similarity(rows)
+    check("and wholly similar", similarity == 1.0, f"{similarity}")
+
+    left_status, right_status = align.align_line_statuses(commented, plain)
+    check("one status per line", len(left_status) == 5 and len(right_status) == 3)
+    check("none of them a difference", not any(s.is_difference for s in left_status + right_status))
+
+    # A comment between instructions stays where it was written.
+    rows = align.align_lines([mov("x2", "x0"), note, br], [mov("x2", "x0"), br])
+    check(
+        "a comment in the middle stays in place",
+        [row.status for row in rows] == [LineStatus.EQUAL, LineStatus.COMMENT, LineStatus.EQUAL],
+        f"{[row.status.value for row in rows]}",
+    )
+    # A real change next to a comment is still a change.
+    rows = align.align_lines([note, mov("x2", "x0")], [mov("x3", "x0"), Line()])
+    check(
+        "code differences are still reported",
+        align.classify_rows(rows) is not align.FunctionStatus.IDENTICAL,
+        f"{[row.status.value for row in rows]}",
+    )
+
+    # Without tokens only a leading `//` is trusted.
+    check("text-only comment lines go too", align.instruction_text("  // note") == "")
+    check(
+        "but not a `//` inside the code",
+        align.instruction_text('puts("http://x")') == 'puts("http://x")',
+    )
+
+    left = func_with_blocks("a", {0x10: ["// a note", "mov x2, x0", "br x2"]})
+    right = func_with_blocks("b", {0x10: ["mov x2, x0", "br x2"]})
+    alignment = align.align_blocks(left, right)
+    check(
+        "the block is identical, not changed",
+        alignment.left_status.get(0x10) is align.BlockStatus.IDENTICAL,
+        f"{alignment.left_status}",
+    )
+    status, _rows = align.classify_pair(left, right)
+    check("and so is the function", status is align.FunctionStatus.IDENTICAL, f"{status}")
+
+
 def test_classification_runs_on_instructions_only():
     """The status comes from the basic blocks, so nothing else can leak in.
 
@@ -906,6 +1005,7 @@ def main() -> int:
         test_function_classification,
         test_annotations_are_not_code,
         test_annotation_only_lines_are_not_instructions,
+        test_comments_are_not_code,
         test_classification_runs_on_instructions_only,
         test_il_is_generated_before_rendering,
         test_render_levels,
