@@ -21,15 +21,15 @@ from collections.abc import Callable
 
 # binaryninjaui must be imported before PySide6; see ui/__init__.
 import binaryninjaui  # noqa: F401
-from PySide6.QtCore import QEvent, QObject, QRectF, QSettings, QSize, Qt, QTimer
+from PySide6.QtCore import QEvent, QObject, QRectF, QSize, Qt, QTimer
 from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QPushButton, QWidget
 
 from ..core.align import counterpart
+from .settings import settings
 
 _SIDE_PROPERTY = "binjaDiffSide"
 _SETTING = "cursorSync"
-_ORGANIZATION = _APPLICATION = "binja-diff"
 
 #: Input that moves a cursor: clicks, and keys (arrows, page up and down).
 _MOVES = {QEvent.Type.MouseButtonRelease, QEvent.Type.KeyRelease}
@@ -95,7 +95,7 @@ class CursorSync(QObject):
             "Sync: clicking a line on one side moves the other side to the matching line"
         )
         self.button.setAccessibleName("Sync")
-        saved = QSettings(_ORGANIZATION, _APPLICATION).value(_SETTING, True)
+        saved = settings().value(_SETTING, True)
         self.button.setChecked(saved not in (False, "false", "0", 0))
         self.button.toggled.connect(self._toggled)
 
@@ -131,6 +131,6 @@ class CursorSync(QObject):
             self._go_to("right" if side == "left" else "left", target)
 
     def _toggled(self, checked: bool) -> None:
-        QSettings(_ORGANIZATION, _APPLICATION).setValue(_SETTING, checked)
+        settings().setValue(_SETTING, checked)
         if checked:
             self.follow("left")

@@ -27,11 +27,20 @@ from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QSplitter, QVBox
 
 from binaryninja import FunctionViewType, HighlightColor, log_warn
 
-from ..core.align import LineStatus, RenderLevel, address_pairs, line_address, render_key
+from ..core.align import (
+    LineStatus,
+    RenderLevel,
+    address_pairs,
+    anchor_row,
+    line_address,
+    render_key,
+)
 from . import difflayer, theme
 from .background import LatestOnly
 from .cursorsync import CursorSync
 from .levelpicker import LevelPicker
+from .settings import remember_splitter
+from .shortcuts import bind_change_navigation
 from .textpane import _render_rows
 
 
@@ -192,6 +201,7 @@ class NativeLinearTab(QWidget):
         self.splitter.addWidget(self.left)
         self.splitter.addWidget(self.right)
         self.splitter.setSizes([1, 1])
+        remember_splitter(self.splitter, "native/splitter")
         layout.addWidget(self.splitter, 1)
 
     @property
@@ -227,6 +237,7 @@ class NativeLinearTab(QWidget):
         self.next_button = QPushButton("Next change", self)
         self.next_button.clicked.connect(lambda: self._go_to_change(1))
         header.addWidget(self.next_button)
+        bind_change_navigation(self, self._go_to_change, self.prev_button, self.next_button)
         return header
 
     @property
@@ -418,11 +429,18 @@ class NativeLinearTab(QWidget):
     def _go_to_change(self, direction: int) -> None:
         if not self._change_rows:
             return
-        self._change_cursor = (
-            (0 if direction > 0 else len(self._change_rows) - 1)
-            if self._change_cursor == -1
-            else (self._change_cursor + direction) % len(self._change_rows)
-        )
+        if self._change_cursor == -1:
+            # From what is on screen, not from the top: after scrolling, "next"
+            # used to jump back to the first change in the function.
+            at = self.left.current_offset()
+            here = anchor_row(self._rows, at) if at is not None else 0
+            ahead = [i for i, row in enumerate(self._change_rows) if row >= here]
+            if direction > 0:
+                self._change_cursor = ahead[0] if ahead else 0
+            else:
+                self._change_cursor = (ahead[0] - 1) if ahead else len(self._change_rows) - 1
+        else:
+            self._change_cursor = (self._change_cursor + direction) % len(self._change_rows)
         row = self._rows[self._change_rows[self._change_cursor]]
         left = line_address(row.left) if row.left is not None else None
         right = line_address(row.right) if row.right is not None else None

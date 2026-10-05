@@ -69,6 +69,18 @@ def test_round_trip():
     check("options recorded", back.options.get("distance") == "haussmann", f"{back.options}")
     check("creation time recorded", bool(back.created))
     check("an unscoped diff saves an empty scope", back.scope == [], f"{back.scope}")
+    check(
+        "matcher-made rows carry no manual flag",
+        all(len(row) == 6 for row in saved.to_dict()["matches"]),
+    )
+
+    result.set_match(0x1200, 0x2200)
+    manual = persist.SavedDiff.from_json(persist.SavedDiff.from_result(result).to_json())
+    check(
+        "a hand-made pair survives the round trip as manual",
+        any(m.manual and m.primary.addr == 0x1200 for m in manual.matches),
+        f"{manual.matches}",
+    )
 
     result.scope = ["AppleSEPManager"]
     scoped = persist.SavedDiff.from_json(persist.SavedDiff.from_result(result).to_json())

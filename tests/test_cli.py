@@ -193,6 +193,64 @@ def test_report_says_what_happened():
     check("nothing to show says so", "no differences" in quiet.getvalue(), quiet.getvalue())
 
 
+def test_machine_readable_reports():
+    print("json and csv carry the verdicts")
+    import csv
+    import json
+
+    result = result_with(
+        [
+            ("same", ["mov x0, x1", "ret"], ["mov x0, x1", "ret"]),
+            ("rewritten", ["mov x0, x1", "ret"], ["add x0, x1, x2", "bl 0x99", "ret"]),
+        ]
+    )
+    result.secondary_unmatched.append(FunctionRef(0x9000, "extra"))
+    counts, rows = cli.classify(result, align, limit=0, show_all=False)
+
+    document = json.loads(cli.report_json(result, counts, rows, show_all=False))
+    check(
+        "counts are in the document",
+        document["counts"] == {"changed": 1, "identical": 1},
+        f"{document['counts']}",
+    )
+    check(
+        "the changed row is listed", [r["primary_name"] for r in document["rows"]] == ["rewritten"]
+    )
+    check("rows carry the line similarity", document["rows"][0]["line_similarity"] is not None)
+    check(
+        "the unmatched are listed too",
+        document["secondary_only"] == [{"addr": 0x9000, "name": "extra"}],
+    )
+
+    out = io.StringIO()
+    cli.report_csv(result, rows, show_all=True, out=out)
+    parsed = list(csv.DictReader(io.StringIO(out.getvalue())))
+    check(
+        "csv has the pair and the unmatched function",
+        [r["status"] for r in parsed] == ["changed", "secondary only"],
+        f"{parsed}",
+    )
+    check("addresses are hex", parsed[0]["primary_addr"] == "0x1100", parsed[0]["primary_addr"])
+
+    check("differences set the exit code", cli.has_differences(result, counts))
+    quiet = result_with([("moved", ["bl 0x1234"], ["bl 0x5678"])])
+    quiet_counts, _rows = cli.classify(quiet, align, limit=0, show_all=False)
+    check("offsets only are not differences", not cli.has_differences(quiet, quiet_counts))
+
+    args = cli.parse_args(["--format", "csv", "--exit-code", "--load", "d.bndiff.json", "a", "b"])
+    check(
+        "the new flags parse",
+        (args.format, args.exit_code, args.load) == ("csv", True, "d.bndiff.json"),
+    )
+    with contextlib.redirect_stderr(io.StringIO()):
+        try:
+            cli.parse_args(["--format", "xml", "a", "b"])
+        except SystemExit as exc:
+            check("an unknown format is refused", exc.code == 2)
+        else:
+            check("an unknown format is refused", False)
+
+
 def test_low_evidence_pair_is_visible():
     print("low-evidence matches are visible even when confidence is high")
     result = result_with([("doubt", ["mov x0, x1"], ["brk #0x1"])])
@@ -215,6 +273,7 @@ def main() -> int:
             test_tuning_arguments_are_validated,
             test_only_differences_are_listed,
             test_report_says_what_happened,
+            test_machine_readable_reports,
             test_low_evidence_pair_is_visible,
         ]
     )

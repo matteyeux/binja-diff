@@ -179,6 +179,8 @@ class SavedDiff:
             # Positional rows rather than one object per match: a 50k-function
             # diff shrinks several-fold, and this payload also has to fit in a
             # database metadata string.
+            # A seventh element marks a pair the user made; left off the rows
+            # the matcher made, which are all of them in most files.
             "matches": [
                 [
                     m.primary.addr,
@@ -187,6 +189,7 @@ class SavedDiff:
                     m.secondary.name,
                     round(m.similarity, 6),
                     round(m.confidence, 6),
+                    *([True] if m.manual else []),
                 ]
                 for m in self.matches
             ],
@@ -216,6 +219,7 @@ class SavedDiff:
                         secondary=FunctionRef(int(row[2]), str(row[3])),
                         similarity=float(row[4]),
                         confidence=float(row[5]),
+                        manual=bool(row[6]) if len(row) > 6 else False,
                     )
                     for row in data.get("matches", [])
                 ],

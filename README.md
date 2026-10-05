@@ -21,8 +21,16 @@ Pseudo C, Pseudo Objective-C or Pseudo Rust.
   unmatched — click a segment to filter
 - Overview strip beside the linear diff marking where the changes are (in the
   text fallback used where the native linear view is unavailable)
-- Double-click a match to jump to it in the primary binary
+- Double-click or press Enter on a match to jump to it in the primary binary
+- Filter the table by name or address; F8 / Shift+F8 step through the changes
+  in every tab
+- Match two functions by hand, or unmatch a pair, from the table's context
+  menu; corrections are saved with the diff
 - Port function names from one binary to the other
+- Callee and string context in a changed pair's tooltip: what only one side
+  calls or uses
+- Matching options (sparsity, tradeoff, distance, extra features) from the
+  **Options...** button; the layout, view choice and sync setting are remembered
 - Diff a single kext from a kernelcache, or one SEP module
 - QBinDiff as a provider for Binary Similarity sessions
 
@@ -99,7 +107,14 @@ python3 binja-diff.py --json out.bndiff.json a.bndb b.bndb
 Engine warnings go to stderr even when it is not a terminal; `--quiet`
 silences them, `--verbose` adds the engine's info log. `--all` lists every
 pair, `--limit N` caps the list, `--no-classify` skips the per-function
-comparison on a large pair.
+comparison on a large pair. For a build or a script:
+
+```bash
+python3 binja-diff.py --format json a.bin b.bin > report.json   # or --format csv
+python3 binja-diff.py --exit-code a.bin b.bin    # 1 if anything changed, 0 if not, 2 on error
+python3 binja-diff.py --load saved.bndiff.json a.bndb b.bndb   # re-report, no matching
+python3 binja-diff.py --context a.bin b.bin      # callees and strings only one side has
+```
 
 ### Binary Similarity
 

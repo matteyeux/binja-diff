@@ -41,8 +41,10 @@ from . import background
 from .dropzone import FILE_FILTER, DropZone, dimmed, local_files
 from .graphpane import GraphDiffTab
 from .matchtable import MatchTable
+from .optionsdialog import OptionsDialog
 from .progresspanel import ProgressPanel
 from .scopedialog import ScopeDialog
+from .settings import remember_splitter
 from .textpane import TextDiffTab
 from . import difflayer, nativelinear
 
@@ -271,6 +273,11 @@ class DiffView(QWidget, View):
         self.open_button.clicked.connect(self.dropzone_browse)
         header.addWidget(self.open_button)
 
+        self.options_button = QPushButton("Options...", self)
+        self.options_button.setToolTip("QBinDiff's matching parameters for the next diff")
+        self.options_button.clicked.connect(self.edit_options)
+        header.addWidget(self.options_button)
+
         self.close_button = QPushButton("Close secondary", self)
         self.close_button.setEnabled(False)
         self.close_button.setToolTip(
@@ -344,6 +351,7 @@ class DiffView(QWidget, View):
         splitter.addWidget(self.tabs)
 
         splitter.setSizes([250, 650])
+        remember_splitter(splitter, "diffview/main")
         layout.addWidget(splitter)
         return container
 
@@ -352,11 +360,18 @@ class DiffView(QWidget, View):
     def dropzone_browse(self) -> None:
         self.dropzone.browse()
 
+    def edit_options(self) -> None:
+        dialog = OptionsDialog(self, self._options)
+        if dialog.exec() == QDialog.Accepted:
+            self._options = dialog.options(self._options)
+
     def start_diff(self, path_or_bv) -> None:
         if self._busy_with():
             QMessageBox.information(self, "Binary diff", f"{self._busy_with()} is already running.")
             return
         if self.data is None:
+            return
+        if self.result is not None and not self._confirm_replace():
             return
 
         # Asked before anything is loaded: the region list comes from the
@@ -388,6 +403,25 @@ class DiffView(QWidget, View):
                 on_cancelled=lambda: execute_on_main_thread(self._on_cancelled),
                 region_name=self._region_name,
             )
+        )
+
+    def _confirm_replace(self) -> bool:
+        """A drop onto the results page discards the diff on screen; ask first.
+
+        The stacked pages keep a second drop out during a run, not after one,
+        and a saved-nowhere diff of forty minutes is a lot to lose to a stray
+        drag.
+        """
+
+        return (
+            QMessageBox.question(
+                self,
+                "Binary diff",
+                "Replace the current diff? It has not been saved unless you saved it.",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            == QMessageBox.Yes
         )
 
     def _choose_region(self) -> bool:
@@ -618,9 +652,22 @@ class DiffView(QWidget, View):
             menu.addAction(
                 "Go to primary function", lambda: self.navigate_to_primary(current)
             ).setToolTip("Leaves the diff; switch back with the view selector")
-            menu.addSeparator()
+        if current is not None:
+            addresses = [
+                f"{addr:#x}"
+                for addr in (current.primary_addr, current.secondary_addr)
+                if addr is not None
+            ]
+            menu.addAction(
+                "Copy address" if len(addresses) == 1 else "Copy both addresses",
+                lambda: QApplication.clipboard().setText("\t".join(addresses)),
+            )
+        menu.addSeparator()
 
-        rows = [row for row in self.table.selected_rows() if row.is_matched]
+        selected = self.table.selected_rows()
+        self._add_correction_actions(menu, selected)
+
+        rows = [row for row in selected if row.is_matched]
         if not rows:
             menu.addAction("No matched function selected").setEnabled(False)
             menu.exec(position)
@@ -646,6 +693,71 @@ class DiffView(QWidget, View):
             for action in (to_primary, to_secondary):
                 action.setEnabled(False)
         menu.exec(position)
+
+    def _add_correction_actions(self, menu: QMenu, selected) -> None:
+        """Match two selected functions by hand, or break the selected pairs.
+
+        Matching wants exactly two rows that between them name one primary
+        and one secondary function — a primary-only and a secondary-only row,
+        or either of those and a matched row, whose old pair is broken first.
+        """
+
+        busy = self._busy_with() is not None
+        matched = [row for row in selected if row.is_matched]
+        if matched:
+            label = "Unmatch pair" if len(matched) == 1 else f"Unmatch {len(matched)} pairs"
+            action = menu.addAction(label, lambda: self._unmatch(matched))
+            action.setToolTip("Both functions become unmatched on their own side")
+            action.setEnabled(not busy)
+
+        if len(selected) == 2 and not all(row.is_matched for row in selected):
+            # Two matched rows name four functions; which two to pair is not
+            # a guess worth making, so that case offers nothing.
+            first, second = selected
+            candidates = [
+                (first.primary_addr, second.secondary_addr),
+                (second.primary_addr, first.secondary_addr),
+            ]
+            pairs = [(p, q) for p, q in candidates if p is not None and q is not None]
+            if pairs:
+                primary_addr, secondary_addr = pairs[0]
+                action = menu.addAction(
+                    f"Match {primary_addr:#x} with {secondary_addr:#x}",
+                    lambda: self._match(primary_addr, secondary_addr),
+                )
+                action.setToolTip("Pairs the two by hand; any pair either was in is broken")
+                action.setEnabled(not busy)
+        if matched or len(selected) == 2:
+            menu.addSeparator()
+
+    def _unmatch(self, rows) -> None:
+        if self.result is None or self._busy_with():
+            return
+        removed = sum(
+            self.result.unmatch(row.primary_addr) is not None
+            for row in rows
+            if row.primary_addr is not None
+        )
+        self._after_correction(f"unmatched {removed} pair(s)")
+
+    def _match(self, primary_addr: int, secondary_addr: int) -> None:
+        if self.result is None or self._busy_with():
+            return
+        try:
+            self.result.set_match(primary_addr, secondary_addr)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Binary diff", str(exc))
+            return
+        self._after_correction(f"matched {primary_addr:#x} with {secondary_addr:#x}")
+        self.table.select_pair(primary_addr, secondary_addr)
+
+    def _after_correction(self, note: str) -> None:
+        # The table is rebuilt from the result; set_result keeps the sort and
+        # the current pair. A correction is a change to the result, so the
+        # header reminds that it is unsaved.
+        self.table.set_result(self.result)
+        self.status.setText(f"{note} · save the diff to keep it")
+        self.status.setToolTip("")
 
     def _port_selected(self, direction, rows) -> None:
         """Port the names of the selected pairs, one undo step for the batch.

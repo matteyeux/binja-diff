@@ -38,11 +38,12 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..core import align
+from ..core import align, context
 from ..core.align import BlockStatus, FunctionStatus, LineStatus
 from ..core.engine import DiffResult
 from . import theme
 from .background import BatchRunner
+from .settings import remember_header
 
 
 class RowKind(str, Enum):
@@ -60,10 +61,17 @@ class MatchRow:
     secondary_name: str
     similarity: float
     confidence: float
+    #: Paired by the user. Shown instead of a confidence, and never flagged
+    #: for review: the matcher's scores say nothing about a pair it did not make.
+    manual: bool = False
 
     @property
     def is_matched(self) -> bool:
         return self.kind is RowKind.MATCHED
+
+    @property
+    def key(self) -> tuple[int | None, int | None]:
+        return (self.primary_addr, self.secondary_addr)
 
 
 #: The IL level the Status column describes, and the one its tooltip explains.
@@ -211,6 +219,8 @@ class MatchTableModel(QAbstractTableModel):
         self._row_of: dict[tuple, int] = {}
         #: Row tints, resolved from the theme once rather than per cell.
         self._colors: dict = {}
+        #: Callee and string context per pair, computed on hover. See explain().
+        self._context: dict[tuple[int, int], str] = {}
         #: Classifies every matched pair in the background, so the summary and
         #: the status filter cover the whole table rather than what was painted.
         self.classifier = BatchRunner("Classifying matched functions")
@@ -362,8 +372,39 @@ class MatchTableModel(QAbstractTableModel):
 
         if not row.is_matched or row.primary_addr is None or row.secondary_addr is None:
             return False
-        same = self._same.get((row.primary_addr, row.secondary_addr))
-        return align.pairing_needs_review(row.similarity, same)
+        return self._needs_review(row, self._same.get((row.primary_addr, row.secondary_addr)))
+
+    @staticmethod
+    def _needs_review(row: MatchRow, same: float | None) -> bool:
+        # The user's own pairing is not up for review on the matcher's score.
+        return not row.manual and align.pairing_needs_review(row.similarity, same)
+
+    def context_of(self, row: MatchRow) -> str:
+        """What the pair's callees and strings say, for the tooltip. Cached.
+
+        Computed on hover rather than in the classification pass: the strings
+        cost a data-reference lookup per instruction, which is fine for the pair
+        under the mouse and not for every pair in the table.
+        """
+
+        if not row.is_matched or self._result is None:
+            return ""
+        if row.primary_addr is None or row.secondary_addr is None:
+            return ""
+        key = (row.primary_addr, row.secondary_addr)
+        cached = self._context.get(key)
+        if cached is not None:
+            return cached
+        primary = self._result.primary_bv.get_function_at(row.primary_addr)
+        secondary = self._result.secondary_bv.get_function_at(row.secondary_addr)
+        text = ""
+        if primary is not None and secondary is not None:
+            try:
+                text = context.context_delta(self._result, primary, secondary).summary()
+            except Exception:
+                text = ""
+        self._context[key] = text
+        return text
 
     def review_count(self) -> int:
         return sum(self.cached_review(row) for row in self._rows)
@@ -435,6 +476,7 @@ class MatchTableModel(QAbstractTableModel):
         self._pattern_counts.clear()
         self._explained.clear()
         self._unrendered.clear()
+        self._context.clear()
         self._retry = []
         self._retried = False
         if result is not None:
@@ -448,6 +490,7 @@ class MatchTableModel(QAbstractTableModel):
                         match.secondary.name,
                         float(match.similarity),
                         float(match.confidence),
+                        manual=match.manual,
                     )
                 )
             for func in result.primary_unmatched:
@@ -511,14 +554,16 @@ class MatchTableModel(QAbstractTableModel):
                 same = self.line_similarity_of(row)
                 return f"{same * 100:.0f}%" if same is not None else ""
             if column == 5:
-                return f"{row.confidence:.3f}" if row.kind is RowKind.MATCHED else "-"
+                if not row.is_matched:
+                    return "-"
+                return "manual" if row.manual else f"{row.confidence:.3f}"
             if column == 6:
                 if not row.is_matched:
                     return row.kind.value
                 status = self.status_of(row)
                 warning = (
                     " · verify pair"
-                    if align.pairing_needs_review(row.similarity, self.line_similarity_of(row))
+                    if self._needs_review(row, self.line_similarity_of(row))
                     else ""
                 )
                 if status is FunctionStatus.CHANGED:
@@ -568,21 +613,26 @@ class MatchTableModel(QAbstractTableModel):
         if role == Qt.ToolTipRole:
             if column == 6:
                 detail = self.explain(row)
-                if row.is_matched and align.pairing_needs_review(
-                    row.similarity, self.line_similarity_of(row)
-                ):
+                if row.is_matched and self._needs_review(row, self.line_similarity_of(row)):
                     detail = (
                         "Pairing needs review: the graph matcher and line comparison both"
                         " found little common code. High matching confidence can still"
                         " occur when no good alternative was available.\n\n" + detail
                     )
+                if row.manual:
+                    detail = "Paired by hand.\n\n" + detail
                 count = self.pattern_count_of(row)
                 if count > 1:
                     detail += (
                         f"\n\nThe same non-minor edit pattern appears in {count} function pairs."
                         " Repetition does not establish cause or importance."
                     )
+                surroundings = self.context_of(row)
+                if surroundings:
+                    detail += "\n\n" + surroundings
                 return detail
+            if column == 5 and row.manual:
+                return "Paired by hand, so the matcher's confidence does not apply."
             if column == 4 and row.is_matched:
                 same = self.line_similarity_of(row)
                 lines = [_HEADER_TOOLTIPS[4]]
@@ -642,8 +692,20 @@ class _FilterProxy(QSortFilterProxyModel):
         if self._review and not model.cached_review(row):
             return False
         if self._text:
-            haystack = f"{row.primary_name} {row.secondary_name}".lower()
-            if self._text not in haystack:
+            # Names, and the addresses as they print, so an address pasted
+            # from a crash log or another tool finds its row — with or
+            # without the 0x.
+            haystack = " ".join(
+                part
+                for part in (
+                    row.primary_name,
+                    row.secondary_name,
+                    f"{row.primary_addr:#x}" if row.primary_addr is not None else "",
+                    f"{row.secondary_addr:#x}" if row.secondary_addr is not None else "",
+                )
+                if part
+            ).lower()
+            if self._text not in haystack and f"0x{self._text}" not in haystack:
                 return False
         return True
 
@@ -772,7 +834,7 @@ class MatchTable(QWidget):
         controls.addWidget(self.filter_combo)
 
         self.search = QLineEdit(self)
-        self.search.setPlaceholderText("Filter by function name...")
+        self.search.setPlaceholderText("Filter by name or address...")
         self.search.textChanged.connect(lambda text: self.proxy.set_text(text))
         controls.addWidget(self.search, 1)
 
@@ -821,8 +883,12 @@ class MatchTable(QWidget):
             self.table.setColumnWidth(column, width)
         header.setStretchLastSection(True)
         header.setSectionResizeMode(QHeaderView.Interactive)
+        # Widths and the sort indicator come back from the last session; the
+        # defaults above apply only the first time.
+        remember_header(header, "matchtable/header")
         self.table.selectionModel().selectionChanged.connect(self._emit_selection)
-        self.table.doubleClicked.connect(self._emit_activated)
+        # activated: a double-click, and Enter on the current row.
+        self.table.activated.connect(self._emit_activated)
         layout.addWidget(self.table, 1)
 
     def _apply_filter(self, index: int) -> None:

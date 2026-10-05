@@ -373,6 +373,7 @@ flowchart TD
         scopeMod["scope.py: kexts and SEP modules"]
         similarityMod["similarity.py: Binary Similarity provider"]
         symbolsMod["symbols.py: porting function names"]
+        contextMod["context.py: callee and string delta per pair"]
     end
     subgraph uiLayer [ui: Qt]
         diffview["diffview.py: DiffView + DiffViewType"]
@@ -388,6 +389,9 @@ flowchart TD
         themeMod["theme.py: colours from the Binary Ninja theme"]
         backgroundMod["background.py: worker threads, no Qt"]
         levelpicker["levelpicker.py: remembered view choice"]
+        settingsMod["settings.py: QSettings, remembered layout"]
+        optionsdialog["optionsdialog.py: DiffOptions for the next run"]
+        shortcutsMod["shortcuts.py: F8 / Shift+F8"]
     end
     backend --> engine
     scopeMod --> engine
@@ -421,6 +425,14 @@ flowchart TD
     themeMod --> textpane
     themeMod --> graphpane
     diffview --> nativelinear
+    diffview --> optionsdialog
+    contextMod --> matchtable
+    settingsMod --> levelpicker
+    settingsMod --> cursorsync
+    settingsMod --> matchtable
+    shortcutsMod --> graphpane
+    shortcutsMod --> textpane
+    shortcutsMod --> nativelinear
 ```
 
 The plugin talks to QBinDiff through `Program.from_backend()`, which accepts an
@@ -475,6 +487,27 @@ the 0.99 row-wise switch is unchanged.
 offer; the CLI keeps a copy (its parser runs before anything can import
 qbindiff) and `test_cli` checks both against the real enum. "correlation" was
 offered for a while and does not exist in QBinDiff.
+
+### Corrections live on the result
+
+`DiffResult.unmatch()` and `set_match()` are how the table's context menu
+breaks or makes a pair. Both move `FunctionRef`s between `matches` and the two
+unmatched lists and `reindex()`; `set_match` frees whatever pair either side
+was in first. A hand-made pair is a `MatchRecord` with `manual=True`,
+`similarity=0.0` and `confidence=1.0`: the matcher's score does not exist for
+it, so `pairing_needs_review` is skipped for manual rows and the Confidence
+column prints "manual". The flag is the optional seventh element of a saved
+match row — left off the rows the matcher made, so old files read unchanged.
+`_take` looks the indexes up by side name on each step rather than through a
+dict captured beforehand: `unmatch` rebuilds them, and a captured one is stale.
+
+`core/context.py` answers "what else did this change touch": callees compared
+*through the diff* (a callee counts as shared when the result pairs it with a
+callee of the other side, or when an unmatched target sits at the same address
+on both — a builtin, a GOT slot), and strings by value. Strings cost a
+data-reference lookup per instruction, so it runs for the pair under the mouse
+(`MatchTableModel.context_of`, cached) and under the CLI's `--context`, never
+in the classification pass.
 
 ### A DiffResult holds records, not qbindiff objects
 
@@ -689,8 +722,9 @@ and offering one that is not loaded would render nothing. The graph pane pairs
 blocks on `level.level` and draws `level.graph_type`, exactly as
 `diff_graphs()` does.
 
-The selector is `ui/levelpicker.py`, which stores the choice in `QSettings` by
-*name*, never by index: the languages offered depend on the plugins loaded, so
+The selector is `ui/levelpicker.py`, which stores the choice through
+`ui/settings.py` (one `QSettings` scope for everything the reader arranges:
+view choice, sync, splitters, the table header) by *name*, never by index: the languages offered depend on the plugins loaded, so
 an index would point at a different view on the next start. Switching views in
 the Linear tab keeps the reader's place by address (`align.anchor_row`), since
 two renderings share nothing else — and not every address, which is why the

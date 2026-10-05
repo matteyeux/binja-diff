@@ -402,6 +402,76 @@ def test_weak_pair_demoted_only_with_local_contradiction():
     )
 
 
+def test_context_delta():
+    """Callees are compared through the diff, strings by value."""
+
+    print("callee and string context for a pair")
+    from binja_diff.core import context, engine
+
+    primary_bv = build_view("primary")
+    secondary_bv = build_view("secondary")
+    secondary_main = secondary_bv.functions[0]
+    # The secondary's main gained a call to a new function and lost the import.
+    secondary_bv.functions.append(Function(secondary_bv, 0x4000, "new_helper", []))
+    secondary_main.callee_addresses = [0x2000, 0x4000, 0x9000]
+
+    class Str:
+        def __init__(self, value):
+            self.value = value
+
+    strings = {
+        (id(primary_bv), 0x1020): "hello",
+        (id(primary_bv), 0x1030): "old only",
+        (id(secondary_bv), 0x1020): "hello",
+    }
+    for bv in (primary_bv, secondary_bv):
+        bv.get_data_refs_from = lambda addr, bv=bv: (
+            [0x5000 + addr] if (id(bv), addr) in strings else []
+        )
+        bv.get_string_at = lambda target, bv=bv: Str(strings[(id(bv), target - 0x5000)])
+
+    result = engine.DiffResult(
+        primary_bv=primary_bv,
+        secondary_bv=secondary_bv,
+        similarity=1.0,
+        matches=[
+            engine.MatchRecord(
+                engine.FunctionRef(0x1000, "main"), engine.FunctionRef(0x1000, "main"), 1, 1
+            ),
+            engine.MatchRecord(
+                engine.FunctionRef(0x2000, "helper"), engine.FunctionRef(0x2000, "helper"), 1, 1
+            ),
+        ],
+    )
+    delta = context.context_delta(result, primary_bv.functions[0], secondary_main)
+    check(
+        "the matched helper and the shared builtin slot are shared",
+        delta.shared_callees == [("helper", "helper"), ("0x9000", "0x9000")],
+        f"{delta.shared_callees}",
+    )
+    check(
+        "the import is only called by the primary",
+        delta.primary_only_callees == ["printf"],
+        f"{delta.primary_only_callees}",
+    )
+    check(
+        "the new helper is only called by the secondary",
+        delta.secondary_only_callees == ["new_helper"],
+    )
+    check(
+        "strings compare by value",
+        (delta.shared_strings, delta.primary_only_strings) == (1, ["old only"]),
+    )
+    check("the delta reads as a difference", delta.differs)
+    summary = delta.summary()
+    check("the summary names the callees", "new_helper" in summary and "printf" in summary, summary)
+    check("and the string", "old only" in summary, summary)
+
+    mirror = engine.DiffResult(primary_bv=primary_bv, secondary_bv=primary_bv, similarity=1.0)
+    same = context.context_delta(mirror, primary_bv.functions[0], primary_bv.functions[0])
+    check("a function against itself has no delta", not same.differs and same.summary() == "")
+
+
 def test_cancel_during_the_anchor_pass():
     """The anchor pass runs inside QBinDiff's silent stretch, where nothing
     used to poll for cancellation: Cancel then waited for the whole matrix."""
@@ -535,6 +605,7 @@ def main() -> int:
             test_name_anchor_pass,
             test_exact_code_anchor_and_bad_name,
             test_weak_pair_demoted_only_with_local_contradiction,
+            test_context_delta,
             test_cancel_during_the_anchor_pass,
             test_name_anchor_end_to_end,
             test_line_alignment,

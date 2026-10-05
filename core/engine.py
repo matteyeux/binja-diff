@@ -642,6 +642,10 @@ class MatchRecord:
     secondary: FunctionRef
     similarity: float
     confidence: float
+    #: Paired by the user rather than the matcher. Kept so the table can say
+    #: so, a saved diff keeps the correction, and nothing flags the pair for
+    #: review on the strength of a score it never had.
+    manual: bool = False
 
 
 @dataclass
@@ -684,6 +688,63 @@ class DiffResult:
 
         self.by_primary = {m.primary.addr: m for m in self.matches}
         self.by_secondary = {m.secondary.addr: m for m in self.matches}
+
+    # -- corrections -------------------------------------------------------
+
+    def unmatch(self, primary_addr: int) -> MatchRecord | None:
+        """Break the pair whose primary side is ``primary_addr``.
+
+        Both functions become unmatched on their own side. Returns the record
+        removed, or ``None`` when the address was not matched.
+        """
+
+        match = self.by_primary.get(primary_addr)
+        if match is None:
+            return None
+        self.matches.remove(match)
+        _insert_ref(self.primary_unmatched, match.primary)
+        _insert_ref(self.secondary_unmatched, match.secondary)
+        self.reindex()
+        return match
+
+    def set_match(self, primary_addr: int, secondary_addr: int) -> MatchRecord:
+        """Pair two functions by hand, breaking whatever pairs they were in.
+
+        The matcher's score is not known for a pair it did not make, so the
+        record carries none (0.0) and is marked ``manual``; what the table
+        shows for it is the line comparison, as for every other pair. Raises
+        ``ValueError`` when either address is no function the result knows.
+        """
+
+        primary = self._take("primary", primary_addr)
+        secondary = self._take("secondary", secondary_addr)
+        record = MatchRecord(primary, secondary, similarity=0.0, confidence=1.0, manual=True)
+        self.matches.append(record)
+        self.reindex()
+        return record
+
+    def _take(self, side: str, addr: int) -> FunctionRef:
+        """The reference for ``addr`` on one side, freed from any pair or list.
+
+        Looked up by side name on each step rather than through a captured
+        dict: ``unmatch`` rebuilds the indexes, so a dict taken before it is
+        stale afterwards.
+        """
+
+        primary = side == "primary"
+        match = (self.by_primary if primary else self.by_secondary).get(addr)
+        if match is not None:
+            self.unmatch(match.primary.addr)
+        unmatched = self.primary_unmatched if primary else self.secondary_unmatched
+        for index, ref in enumerate(unmatched):
+            if ref.addr == addr:
+                del unmatched[index]
+                return ref
+        bv = self.primary_bv if primary else self.secondary_bv
+        func = bv.get_function_at(addr) if bv is not None else None
+        if func is None:
+            raise ValueError(f"no function at {addr:#x}")
+        return FunctionRef(addr, func.name)
 
     @classmethod
     def build(cls, primary_bv, secondary_bv, mapping: Mapping) -> DiffResult:
@@ -732,6 +793,14 @@ class DiffResult:
     @property
     def nb_unmatched_secondary(self) -> int:
         return len(self.secondary_unmatched)
+
+
+def _insert_ref(refs: list[FunctionRef], ref: FunctionRef) -> None:
+    """Put ``ref`` into an address-ordered list, once."""
+
+    if any(existing.addr == ref.addr for existing in refs):
+        return
+    bisect.insort(refs, ref, key=lambda existing: existing.addr)
 
 
 #: Binary Ninja database extension. Loading one restores the saved analysis,

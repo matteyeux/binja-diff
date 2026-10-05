@@ -374,6 +374,86 @@ def test_result_indexing():
     )
 
 
+def test_manual_corrections():
+    """A pair the user makes or breaks moves between the lists, and nothing
+    else about the result changes."""
+
+    print("matching and unmatching by hand")
+    stubs = _bootstrap.stubs()
+    primary, secondary = stubs.BinaryView("/tmp/a"), stubs.BinaryView("/tmp/b")
+    secondary.functions.append(stubs.Function(secondary, 0x2300, "fresh", []))
+    result = engine.DiffResult(
+        primary_bv=primary,
+        secondary_bv=secondary,
+        similarity=0.5,
+        matches=[
+            engine.MatchRecord(
+                engine.FunctionRef(0x1000, "a"), engine.FunctionRef(0x2000, "a"), 0.9, 0.9
+            ),
+            engine.MatchRecord(
+                engine.FunctionRef(0x1100, "b"), engine.FunctionRef(0x2100, "x"), 0.1, 0.5
+            ),
+        ],
+        primary_unmatched=[engine.FunctionRef(0x1200, "c")],
+        secondary_unmatched=[engine.FunctionRef(0x2200, "d")],
+    )
+
+    removed = result.unmatch(0x1100)
+    check("the record comes back", removed is not None and removed.secondary.addr == 0x2100)
+    check("the pair is gone", 0x1100 not in result.by_primary and 0x2100 not in result.by_secondary)
+    check(
+        "both halves are unmatched, in address order",
+        [r.addr for r in result.primary_unmatched] == [0x1100, 0x1200]
+        and [r.addr for r in result.secondary_unmatched] == [0x2100, 0x2200],
+        f"{result.primary_unmatched} {result.secondary_unmatched}",
+    )
+    check("unmatching an unmatched address is a no-op", result.unmatch(0x1100) is None)
+
+    made = result.set_match(0x1200, 0x2100)
+    check("the new pair is marked manual", made.manual and made.confidence == 1.0)
+    check(
+        "it is indexed", result.by_primary[0x1200] is made and result.by_secondary[0x2100] is made
+    )
+    check(
+        "both halves left the unmatched lists",
+        [r.addr for r in result.primary_unmatched] == [0x1100]
+        and [r.addr for r in result.secondary_unmatched] == [0x2200],
+    )
+    check(
+        "the name travelled with the reference",
+        made.primary.name == "c" and made.secondary.name == "x",
+    )
+
+    # Re-pairing a matched function breaks its old pair first.
+    repaired = result.set_match(0x1000, 0x2100)
+    check(
+        "the old partner of each side is freed",
+        0x1200 in {r.addr for r in result.primary_unmatched},
+    )
+    check(
+        "and the old pair of the other side too",
+        0x2000 in {r.addr for r in result.secondary_unmatched},
+    )
+    check(
+        "the new pair stands",
+        result.by_primary[0x1000] is repaired and repaired.secondary.addr == 0x2100,
+    )
+    check(
+        "every function appears exactly once",
+        len(result.matches) == 1 and len(result.primary_unmatched) == 2,
+    )
+
+    # An address the result never saw is taken from the live view, or refused.
+    from_view = result.set_match(0x1100, 0x2300)
+    check("a function the view knows can be paired", from_view.secondary.name == "fresh")
+    try:
+        result.set_match(0x1100, 0x9999)
+    except ValueError as exc:
+        check("an unknown address is refused", "0x9999" in str(exc))
+    else:
+        check("an unknown address is refused", False, "no error")
+
+
 def test_wait_for_analysis():
     print("waiting for analysis")
     stubs = _bootstrap.stubs()
@@ -554,6 +634,7 @@ def main() -> int:
             test_sparsity_scaling,
             test_feature_selection,
             test_result_indexing,
+            test_manual_corrections,
             test_wait_for_analysis,
             test_log_bridge,
             test_duration_formatting,

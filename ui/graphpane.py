@@ -23,6 +23,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
+    QPushButton,
     QSplitter,
     QVBoxLayout,
     QWidget,
@@ -48,6 +49,8 @@ from . import theme
 from .background import LatestOnly
 from .cursorsync import CursorSync
 from .levelpicker import LevelPicker
+from .settings import remember_splitter
+from .shortcuts import bind_change_navigation
 
 
 def build_graph(func, level: RenderLevel):
@@ -158,6 +161,10 @@ class GraphDiffTab(QWidget):
         #: What the panes currently show, so coming back to this tab for the
         #: same pair does not lay both graphs out again. See show_pair.
         self._shown: tuple | None = None
+        #: (left address, right address) of each changed or one-sided block,
+        #: in address order, for next/previous.
+        self._changes: list[tuple[int | None, int | None]] = []
+        self._change_cursor = -1
         self.sync = CursorSync(
             self,
             lambda side: self._pane(side).graph.getCurrentOffset(),
@@ -183,7 +190,16 @@ class GraphDiffTab(QWidget):
         header.addSpacing(16)
         header.addWidget(self.summary)
         header.addStretch(1)
+        self.position = QLabel("", self)
+        header.addWidget(self.position)
         header.addWidget(self.sync.button)
+        self.prev_button = QPushButton("Previous change", self)
+        self.prev_button.clicked.connect(lambda: self._go_to_change(-1))
+        header.addWidget(self.prev_button)
+        self.next_button = QPushButton("Next change", self)
+        self.next_button.clicked.connect(lambda: self._go_to_change(1))
+        header.addWidget(self.next_button)
+        bind_change_navigation(self, self._go_to_change, self.prev_button, self.next_button)
         layout.addLayout(header)
 
         self.splitter = QSplitter(Qt.Horizontal, self)
@@ -192,7 +208,9 @@ class GraphDiffTab(QWidget):
         self.splitter.addWidget(self.left)
         self.splitter.addWidget(self.right)
         self.splitter.setSizes([1, 1])
+        remember_splitter(self.splitter, "graph/splitter")
         layout.addWidget(self.splitter, 1)
+        self._index_changes()
 
     @property
     def renderer(self) -> LatestOnly:
@@ -277,12 +295,14 @@ class GraphDiffTab(QWidget):
         self.splitter.setEnabled(False)
 
         def deliver(rendered) -> None:
-            left_graph, right_graph, summary, pairs = rendered
+            left_graph, right_graph, summary, pairs, changes = rendered
             self.sync.set_pairs(pairs)
             self.summary.setText(summary)
             self.left.show_graph(left_graph)
             self.right.show_graph(right_graph)
             self.splitter.setEnabled(True)
+            self._changes = changes
+            self._index_changes()
             self._shown = key
 
         def fail(exc: BaseException) -> None:
@@ -308,12 +328,40 @@ class GraphDiffTab(QWidget):
         else:
             self.right.set_title("no match")
 
+    def _index_changes(self) -> None:
+        self._change_cursor = -1
+        has_changes = bool(self._changes)
+        self.prev_button.setEnabled(has_changes)
+        self.next_button.setEnabled(has_changes)
+        if not has_changes:
+            self.position.setText("")
+        else:
+            self.position.setText(f"{len(self._changes)} changed block(s)")
+
+    def _go_to_change(self, direction: int) -> None:
+        """Centre both graphs on the next (or previous) block that differs."""
+
+        if not self._changes:
+            return
+        if self._change_cursor == -1:
+            self._change_cursor = 0 if direction > 0 else len(self._changes) - 1
+        else:
+            self._change_cursor = (self._change_cursor + direction) % len(self._changes)
+        left, right = self._changes[self._change_cursor]
+        if left is not None:
+            self.left.show_address(left)
+        if right is not None:
+            self.right.show_address(right)
+        self.position.setText(f"block {self._change_cursor + 1} of {len(self._changes)}")
+
     def clear(self) -> None:
         self._renderer.cancel()
         self._shown = None
         self.sync.set_pairs([])
         self._left_func = None
         self._right_func = None
+        self._changes = []
+        self._index_changes()
         self.splitter.setEnabled(True)
         self.summary.setText("")
         self.left.set_title("Primary")
@@ -360,7 +408,41 @@ def render_pair(left_func, right_func, level: RenderLevel, colors: dict):
                 function_instruction_lines(right_func, level.level),
             )
         )
-    return left_graph, right_graph, summary, pairs
+    changes = _change_targets(alignment, left_nodes, right_nodes)
+    return left_graph, right_graph, summary, pairs, changes
+
+
+def _node_address(node) -> int | None:
+    """Where a node's code starts, as an address the widget can show.
+
+    At IL levels ``BasicBlock.start`` is an instruction index; the lines the
+    node draws carry the real address of each instruction, so the first one
+    with an address is what to scroll to.
+    """
+
+    for line in node.lines:
+        address = getattr(line, "address", None)
+        if isinstance(address, int) and address:
+            return address
+    return None
+
+
+def _change_targets(
+    alignment: BlockAlignment, left_nodes, right_nodes
+) -> list[tuple[int | None, int | None]]:
+    """The blocks worth stepping through: changed pairs and one-sided blocks."""
+
+    targets = []
+    for pair in alignment.pairs:
+        if pair.status is BlockStatus.IDENTICAL:
+            continue
+        left = left_nodes.get(pair.left_addr) if pair.left_addr is not None else None
+        right = right_nodes.get(pair.right_addr) if pair.right_addr is not None else None
+        left_at = _node_address(left) if left is not None else None
+        right_at = _node_address(right) if right is not None else None
+        if left_at is not None or right_at is not None:
+            targets.append((left_at, right_at))
+    return targets
 
 
 def _unmatched(func, level: RenderLevel) -> dict[int, BlockStatus]:

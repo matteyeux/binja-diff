@@ -16,13 +16,10 @@ disassembly on each new diff has to be reset every time.
 from __future__ import annotations
 
 import binaryninjaui  # noqa: F401  (must precede PySide6)
-from PySide6.QtCore import QSettings
 from PySide6.QtWidgets import QComboBox, QWidget
 
 from ..core.align import RenderLevel, available_levels
-
-_ORGANIZATION = "binja-diff"
-_APPLICATION = "binja-diff"
+from .settings import settings
 
 
 class LevelPicker(QComboBox):
@@ -39,7 +36,7 @@ class LevelPicker(QComboBox):
         self._levels = available_levels()
         self.addItems([level.name for level in self._levels])
 
-        saved = QSettings(_ORGANIZATION, _APPLICATION).value(self._key)
+        saved = settings().value(self._key)
         index = self.findText(saved) if isinstance(saved, str) else -1
         if index >= 0:
             self.setCurrentIndex(index)
@@ -50,4 +47,4 @@ class LevelPicker(QComboBox):
         return self._levels[max(self.currentIndex(), 0)]
 
     def _save(self, _index: int) -> None:
-        QSettings(_ORGANIZATION, _APPLICATION).setValue(self._key, self.level.name)
+        settings().setValue(self._key, self.level.name)

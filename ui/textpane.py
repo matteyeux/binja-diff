@@ -45,6 +45,8 @@ from ..core.align import (
 from . import theme
 from .background import LatestOnly
 from .levelpicker import LevelPicker
+from .settings import remember_splitter
+from .shortcuts import bind_change_navigation
 
 
 def _as_text_line(line):
@@ -299,6 +301,7 @@ class TextDiffTab(QWidget):
         self.splitter.addWidget(self.left)
         self.splitter.addWidget(self.right)
         self.splitter.setSizes([1, 1])
+        remember_splitter(self.splitter, "linear/splitter")
         body.addWidget(self.splitter, 1)
         self.overview = DiffOverview(self, self._scroll_to_row)
         body.addWidget(self.overview)
@@ -347,6 +350,7 @@ class TextDiffTab(QWidget):
         self.next_button = QPushButton("Next change", self)
         self.next_button.clicked.connect(lambda: self._go_to_change(1))
         header.addWidget(self.next_button)
+        bind_change_navigation(self, self._go_to_change, self.prev_button, self.next_button)
 
         return header
 
