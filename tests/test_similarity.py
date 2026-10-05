@@ -6,7 +6,7 @@ score conversion a resolver thresholds on, reading settings that may not carry
 our schema, the entity lookup, and that the module keeps quiet on a Binary
 Ninja with no similarity API at all.
 
-    .venv/bin/python binja_diff/tests/test_similarity.py
+    .venv/bin/python tests/test_similarity.py
 """
 
 from __future__ import annotations
@@ -26,14 +26,7 @@ from binja_diff.core import similarity  # noqa: E402
 from binja_diff.core.engine import DiffOptions  # noqa: E402
 
 
-def check(label: str, condition: bool, detail: str = "") -> None:
-    status = "ok  " if condition else "FAIL"
-    print(f"  [{status}] {label}{(' -- ' + detail) if detail and not condition else ''}")
-    if not condition:
-        check.failures += 1
-
-
-check.failures = 0
+check = _bootstrap.check
 
 
 class FakeEntityInfo:
@@ -148,20 +141,15 @@ def test_registration_is_skipped_without_the_api():
 
 
 def main() -> int:
-    for test in (
-        test_scores_span_the_byte_range,
-        test_settings_fall_back_to_the_defaults,
-        test_entities_are_found_by_address,
-        test_the_other_side_is_found_through_the_graph,
-        test_registration_is_skipped_without_the_api,
-    ):
-        test()
-    print()
-    if check.failures:
-        print(f"{check.failures} check(s) failed")
-        return 1
-    print("all checks passed")
-    return 0
+    return _bootstrap.run(
+        [
+            test_scores_span_the_byte_range,
+            test_settings_fall_back_to_the_defaults,
+            test_entities_are_found_by_address,
+            test_the_other_side_is_found_through_the_graph,
+            test_registration_is_skipped_without_the_api,
+        ]
+    )
 
 
 if __name__ == "__main__":

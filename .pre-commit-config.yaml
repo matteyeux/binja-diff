@@ -7,7 +7,7 @@
 
 repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.16.1
+    rev: v0.16.10
     hooks:
       # --force-exclude is in the hook's own entry, which is what makes the
       # vendored trees stay excluded even though pre-commit passes explicit
@@ -17,7 +17,7 @@ repos:
       - id: ruff-format
 
   - repo: https://github.com/astral-sh/ty-pre-commit
-    rev: v0.0.65
+    rev: v0.0.84
     hooks:
       # Checks the whole project rather than the staged files: deleting a
       # symbol in one module produces diagnostics in another, so a hook that

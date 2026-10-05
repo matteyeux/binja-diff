@@ -104,6 +104,15 @@ _HEADER_TOOLTIPS = {
 }
 
 
+#: Past this many rows in one batch, one repaint of the span costs less than
+#: one signal per row.
+_REPAINT_ROWS_INDIVIDUALLY = 200
+
+#: The Status column, and the two columns whose sort key is a verdict and so
+#: changes as classification lands.
+_STATUS_COLUMN = 6
+_VERDICT_COLUMNS = (4, _STATUS_COLUMN)
+
 #: Status column sort order, most interesting first. Rows not classified yet
 #: sort after every verdict, whichever way the column is sorted.
 _STATUS_RANK = {
@@ -115,8 +124,39 @@ _STATUS_RANK = {
 _UNCLASSIFIED_RANK = len(_STATUS_RANK)
 
 
+def _explain_rows(rows) -> str:
+    """The differing lines of a pair, for the status cell's tooltip."""
+
+    differing = [aligned for aligned in rows if aligned.status.is_difference]
+    if not differing:
+        return "no differing instructions"
+    lines = [f"{len(differing)} differing line(s):"]
+    for aligned in differing[:_EXPLAIN_LINES]:
+        lines.append(f"{aligned.status.marker} {aligned.status.value}")
+        lines.append(f"    {aligned.left if aligned.left is not None else '-'}")
+        lines.append(f"    {aligned.right if aligned.right is not None else '-'}")
+    if len(differing) > _EXPLAIN_LINES:
+        lines.append(f"... and {len(differing) - _EXPLAIN_LINES} more")
+    return "\n".join(lines)
+
+
+def _verdict(status, rows) -> tuple:
+    """Everything the table keeps about a pair, from one alignment.
+
+    The tooltip text is built here too: it used to be aligned again on hover,
+    on the UI thread, from rows this had already thrown away.
+    """
+
+    return (
+        status,
+        align.text_similarity(rows) if rows else None,
+        align.edit_pattern(rows) if status is FunctionStatus.CHANGED else None,
+        _explain_rows(rows) if rows else None,
+    )
+
+
 def _classify_off_thread(result: DiffResult, key: tuple[int, int]):
-    """(status, line similarity) for one pair, or None. Runs on a worker thread."""
+    """The verdict for one pair, or None. Runs on a worker thread."""
 
     primary = result.primary_bv.get_function_at(key[0])
     secondary = result.secondary_bv.get_function_at(key[1])
@@ -125,11 +165,7 @@ def _classify_off_thread(result: DiffResult, key: tuple[int, int]):
     status, rows = align.classify_pair(primary, secondary, _LEVEL)
     if status is None:
         return None
-    return (
-        status,
-        align.text_similarity(rows) if rows else None,
-        align.edit_pattern(rows) if status is FunctionStatus.CHANGED else None,
-    )
+    return _verdict(status, rows)
 
 
 def _status_color(status: FunctionStatus | None):
@@ -161,8 +197,20 @@ class MatchTableModel(QAbstractTableModel):
         #: repetitions of a conservative, binary-agnostic fingerprint.
         self._patterns: dict[tuple[int, int], str] = {}
         self._pattern_counts: Counter[str] = Counter()
-        #: Tooltip text per pair, filled on hover. See explain().
+        #: Tooltip text per pair, filled with the verdict. See explain().
         self._explained: dict[tuple[int, int], str] = {}
+        #: Pairs that rendered nothing when painting asked. Asked once more by
+        #: the background pass at the end, not on every repaint: re-aligning a
+        #: function that will not render, per paint, is what made a row with
+        #: a stuck IL freeze the table.
+        self._unrendered: set[tuple[int, int]] = set()
+        self._retry: list[tuple[int, int]] = []
+        self._retried = False
+        #: Row index per (primary, secondary) address pair, so a batch of
+        #: verdicts repaints the rows it concerns rather than the whole table.
+        self._row_of: dict[tuple, int] = {}
+        #: Row tints, resolved from the theme once rather than per cell.
+        self._colors: dict = {}
         #: Classifies every matched pair in the background, so the summary and
         #: the status filter cover the whole table rather than what was painted.
         self.classifier = BatchRunner("Classifying matched functions")
@@ -185,6 +233,8 @@ class MatchTableModel(QAbstractTableModel):
         cached = self._status.get(key)
         if cached is not None:
             return cached, self._same.get(key)
+        if key in self._unrendered:
+            return None, None
 
         primary = self._result.primary_bv.get_function_at(row.primary_addr)
         secondary = self._result.secondary_bv.get_function_at(row.secondary_addr)
@@ -196,15 +246,11 @@ class MatchTableModel(QAbstractTableModel):
             # Painting must not fail over a function that will not render.
             status, rows = align.FunctionStatus.UNKNOWN, []
         if status is None:
-            # Not drawn yet. Leave the cell blank and ask again on the next
-            # repaint rather than record a verdict taken from half a function.
+            # Not drawn yet. Leave the cell blank rather than record a verdict
+            # taken from half a function; the background pass asks again once.
+            self._unrendered.add(key)
             return None, None
-        self._remember(
-            key,
-            status,
-            align.text_similarity(rows) if rows else None,
-            align.edit_pattern(rows) if status is FunctionStatus.CHANGED else None,
-        )
+        self._remember(key, *_verdict(status, rows))
         return status, self._same.get(key)
 
     def _remember(
@@ -213,13 +259,31 @@ class MatchTableModel(QAbstractTableModel):
         status: FunctionStatus,
         same: float | None,
         pattern: str | None,
+        explained: str | None = None,
     ) -> None:
         self._status.setdefault(key, status)
+        self._unrendered.discard(key)
         if same is not None:
             self._same.setdefault(key, same)
         if pattern is not None and key not in self._patterns:
             self._patterns[key] = pattern
             self._pattern_counts[pattern] += 1
+        if explained is not None:
+            self._explained.setdefault(key, explained)
+
+    def _row_color(self, status):
+        """A row's tint, resolved from the theme the first time it is asked for.
+
+        ``getThemeColor`` is a UI call behind every tint, and ``data`` asked for
+        it per cell per repaint; the handful of distinct answers is cached.
+        """
+
+        if status not in self._colors:
+            if status is BlockStatus.UNMATCHED:
+                self._colors[status] = theme.block_color(BlockStatus.UNMATCHED)
+            else:
+                self._colors[status] = _status_color(status)
+        return self._colors[status]
 
     def pattern_count_of(self, row: MatchRow) -> int:
         if row.primary_addr is None or row.secondary_addr is None:
@@ -261,27 +325,23 @@ class MatchTableModel(QAbstractTableModel):
         if cached is not None:
             return cached
 
+        # Only a pair nothing has classified yet gets here — the verdict
+        # carries its own explanation — and a pair the pass found too large
+        # to classify, whose status says so.
         primary = self._result.primary_bv.get_function_at(row.primary_addr)
         secondary = self._result.secondary_bv.get_function_at(row.secondary_addr)
         if primary is None or secondary is None:
             return ""
         try:
-            _status, rows = align.classify_pair(primary, secondary, _LEVEL)
+            status, rows = align.classify_pair(primary, secondary, _LEVEL)
         except Exception as exc:
             return f"could not render this pair: {exc}"
-
-        differing = [aligned for aligned in rows if aligned.status.is_difference]
-        if not differing:
-            text = "no differing instructions"
+        if status is None:
+            return "not rendered yet"
+        if status is FunctionStatus.UNKNOWN:
+            text = "too large to classify while scrolling; open the pair to compare it"
         else:
-            lines = [f"{len(differing)} differing line(s):"]
-            for aligned in differing[:_EXPLAIN_LINES]:
-                lines.append(f"{aligned.status.marker} {aligned.status.value}")
-                lines.append(f"    {aligned.left if aligned.left is not None else '-'}")
-                lines.append(f"    {aligned.right if aligned.right is not None else '-'}")
-            if len(differing) > _EXPLAIN_LINES:
-                lines.append(f"... and {len(differing) - _EXPLAIN_LINES} more")
-            text = "\n".join(lines)
+            text = _explain_rows(rows)
         self._explained[key] = text
         return text
 
@@ -338,15 +398,29 @@ class MatchTableModel(QAbstractTableModel):
     def _absorb(self, batch: list, finished: bool) -> None:
         """Take a batch of verdicts from the background pass. UI thread."""
 
+        rows: list[int] = []
         for key, value in batch:
             if value is None:
+                # Rendered nothing, or raised. Asked once more at the end of
+                # the pass, when whatever was still loading has had time to.
+                self._retry.append(key)
                 continue
-            status, same, pattern = value
-            self._remember(key, status, same, pattern)
-        if self._rows:
-            self.dataChanged.emit(
-                self.index(0, 0), self.index(len(self._rows) - 1, len(_COLUMNS) - 1)
-            )
+            self._remember(key, *value)
+            index = self._row_of.get(key)
+            if index is not None:
+                rows.append(index)
+        if rows:
+            last = len(_COLUMNS) - 1
+            if len(rows) > _REPAINT_ROWS_INDIVIDUALLY:
+                self.dataChanged.emit(self.index(min(rows), 0), self.index(max(rows), last))
+            else:
+                for index in rows:
+                    self.dataChanged.emit(self.index(index, 0), self.index(index, last))
+        if finished and self._retry and not self._retried and self._result is not None:
+            self._retried = True
+            retry, self._retry = self._retry, []
+            self.classifier.start(retry, partial(_classify_off_thread, self._result), self._absorb)
+            finished = False
         if self.on_progress is not None:
             self.on_progress(finished)
 
@@ -360,6 +434,9 @@ class MatchTableModel(QAbstractTableModel):
         self._patterns.clear()
         self._pattern_counts.clear()
         self._explained.clear()
+        self._unrendered.clear()
+        self._retry = []
+        self._retried = False
         if result is not None:
             for match in result.matches:
                 self._rows.append(
@@ -382,8 +459,16 @@ class MatchTableModel(QAbstractTableModel):
                     MatchRow(RowKind.SECONDARY_ONLY, None, "", func.addr, func.name, 0.0, 0.0)
                 )
             self._rows.sort(key=lambda r: (-r.similarity, r.primary_addr or r.secondary_addr or 0))
+        self._row_of = {
+            (row.primary_addr, row.secondary_addr): index for index, row in enumerate(self._rows)
+        }
         self.endResetModel()
         self._start_classification()
+
+    def row_index(self, primary_addr: int | None, secondary_addr: int | None) -> int | None:
+        """The source row showing this pair, if the result has it."""
+
+        return self._row_of.get((primary_addr, secondary_addr))
 
     def row_at(self, index: int) -> MatchRow | None:
         if 0 <= index < len(self._rows):
@@ -448,29 +533,37 @@ class MatchTableModel(QAbstractTableModel):
         # exactly what the laziness avoids — and the background pass fills in
         # the rest.
         if role == Qt.UserRole:
-            # The Similarity column sorts on whatever has been classified already,
-            # falling back to QBinDiff's score for rows nobody has looked at:
-            # sorting asks every row at once, and classifying the whole table
-            # on the UI thread is exactly what the laziness above avoids.
-            same = self._same.get((row.primary_addr or 0, row.secondary_addr or 0))
+            # One key per column, computed for that column alone: a sort asks
+            # this of every row, and building all seven keys to index one
+            # multiplied that work by seven.
+            if column == 0:
+                return row.primary_name
+            if column == 1:
+                return row.primary_addr or 0
+            if column == 2:
+                return row.secondary_name
+            if column == 3:
+                return row.secondary_addr or 0
+            if column == 4:
+                # The Similarity column sorts on whatever has been classified
+                # already, falling back to QBinDiff's score for rows nobody
+                # has looked at: sorting asks every row at once, and
+                # classifying the whole table on the UI thread is exactly what
+                # the laziness above avoids.
+                same = self._same.get((row.primary_addr or 0, row.secondary_addr or 0))
+                return row.similarity if same is None else same
+            if column == 5:
+                return row.confidence
             return (
-                row.primary_name,
-                row.primary_addr or 0,
-                row.secondary_name,
-                row.secondary_addr or 0,
-                row.similarity if same is None else same,
-                row.confidence,
-                (
-                    row.kind.value,
-                    _STATUS_RANK.get(self.cached_status(row), _UNCLASSIFIED_RANK),
-                    -row.similarity,
-                ),
-            )[column]
+                row.kind.value,
+                _STATUS_RANK.get(self.cached_status(row), _UNCLASSIFIED_RANK),
+                -row.similarity,
+            )
 
         if role == Qt.BackgroundRole:
             if not row.is_matched:
-                return theme.block_color(BlockStatus.UNMATCHED)
-            return _status_color(self.status_of(row))
+                return self._row_color(BlockStatus.UNMATCHED)
+            return self._row_color(self.status_of(row))
 
         if role == Qt.ToolTipRole:
             if column == 6:
@@ -706,6 +799,12 @@ class MatchTable(QWidget):
 
         self.table = QTableView(self)
         self.table.setModel(self.proxy)
+        # Status ascending is the one order the table ever had: unclassified
+        # rows tie on rank and fall back to QBinDiff's score, so a fresh result
+        # reads by similarity, and once the pass finishes the changed functions
+        # come first. Set before sorting is enabled, so the indicator the
+        # header shows is the order the rows are actually in.
+        self.table.horizontalHeader().setSortIndicator(_STATUS_COLUMN, Qt.AscendingOrder)
         self.table.setSortingEnabled(True)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         # Extended rather than single: porting a name is worth doing to a
@@ -781,6 +880,15 @@ class MatchTable(QWidget):
         self.summary_text.setText("   ".join(parts))
         if self.proxy.filters_on_status:
             self.proxy.invalidateFilter()
+        if finished and self.table.horizontalHeader().sortIndicatorSection() in _VERDICT_COLUMNS:
+            # Verdicts landed after the table was sorted on them, so the order
+            # on screen is stale. Once, when the pass is done — never per batch,
+            # which would pull rows out from under the reader — and with the
+            # current row kept in view.
+            self._resort()
+            index = self.table.currentIndex()
+            if index.isValid():
+                self.table.scrollTo(index)
 
     def _emit_activated(self, index) -> None:
         if index.isValid():
@@ -823,7 +931,12 @@ class MatchTable(QWidget):
         return rows
 
     def set_result(self, result: DiffResult | None) -> None:
+        current = self._current_row()
         self.model.set_result(result)
+        # A model reset leaves the proxy in source order while the header
+        # still shows the previous sort, with dynamic sorting off. Sort once,
+        # explicitly, by what the header says.
+        self._resort()
         self._on_classified(False)
         if result is None:
             self.stats.setText("")
@@ -840,5 +953,35 @@ class MatchTable(QWidget):
             "QBinDiff's aggregate graph score. It does not measure matching accuracy;"
             " review pairs marked 'verify pair'."
         )
+        # The same pair as before where the new result still has it — a port
+        # refreshes the result and must not throw the reader back to the top.
+        if current is not None and self.select_pair(current.primary_addr, current.secondary_addr):
+            return
         if self.proxy.rowCount() > 0:
             self.table.selectRow(0)
+
+    def _current_row(self) -> MatchRow | None:
+        index = self.table.currentIndex()
+        if not index.isValid():
+            return None
+        return self.model.row_at(self.proxy.mapToSource(index).row())
+
+    def _resort(self) -> None:
+        header = self.table.horizontalHeader()
+        section = header.sortIndicatorSection()
+        if 0 <= section < len(_COLUMNS):
+            self.proxy.sort(section, header.sortIndicatorOrder())
+
+    def select_pair(self, primary_addr: int | None, secondary_addr: int | None) -> bool:
+        """Select and show the row for this pair. False if the table has none."""
+
+        source_row = self.model.row_index(primary_addr, secondary_addr)
+        if source_row is None:
+            return False
+        index = self.proxy.mapFromSource(self.model.index(source_row, 0))
+        if not index.isValid():
+            return False
+        self.table.setCurrentIndex(index)
+        self.table.selectRow(index.row())
+        self.table.scrollTo(index)
+        return True

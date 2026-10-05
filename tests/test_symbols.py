@@ -4,7 +4,7 @@ Every rename here lands in somebody's database, so the tests are mostly about
 what porting refuses to do: overwrite work that is already there, propagate a
 placeholder name, or act on a weak match.
 
-    .venv-qbindiff-312/bin/python binja_diff/tests/test_symbols.py
+    .venv/bin/python tests/test_symbols.py
 """
 
 from __future__ import annotations
@@ -24,14 +24,7 @@ from binja_diff.core import symbols  # noqa: E402
 from binja_diff.core.engine import DiffResult, FunctionRef, MatchRecord  # noqa: E402
 
 
-def check(label: str, condition: bool, detail: str = "") -> None:
-    status = "ok  " if condition else "FAIL"
-    print(f"  [{status}] {label}{(' -- ' + detail) if detail and not condition else ''}")
-    if not condition:
-        check.failures += 1
-
-
-check.failures = 0
+check = _bootstrap.check
 
 
 def make_view(name: str, functions: dict[int, str]):
@@ -295,29 +288,24 @@ def test_a_selected_pair_ignores_the_similarity_floor():
 
 
 def main() -> int:
-    for test in (
-        test_ports_names_into_the_primary,
-        test_only_the_selected_pairs_are_planned,
-        test_a_selected_pair_ignores_the_similarity_floor,
-        test_direction_is_respected,
-        test_direction_survives_a_plain_string,
-        test_refuses_to_propagate_placeholders,
-        test_existing_names_are_kept,
-        test_weak_matches_are_left_alone,
-        test_identical_names_are_not_rewritten,
-        test_failure_reverts_the_batch,
-        test_cancel_keeps_what_was_applied,
-        test_refresh_names_updates_the_result,
-        test_missing_functions_are_reported,
-        test_summary_reads_sensibly,
-    ):
-        test()
-    print()
-    if check.failures:
-        print(f"{check.failures} check(s) failed")
-        return 1
-    print("all checks passed")
-    return 0
+    return _bootstrap.run(
+        [
+            test_ports_names_into_the_primary,
+            test_only_the_selected_pairs_are_planned,
+            test_a_selected_pair_ignores_the_similarity_floor,
+            test_direction_is_respected,
+            test_direction_survives_a_plain_string,
+            test_refuses_to_propagate_placeholders,
+            test_existing_names_are_kept,
+            test_weak_matches_are_left_alone,
+            test_identical_names_are_not_rewritten,
+            test_failure_reverts_the_batch,
+            test_cancel_keeps_what_was_applied,
+            test_refresh_names_updates_the_result,
+            test_missing_functions_are_reported,
+            test_summary_reads_sensibly,
+        ]
+    )
 
 
 if __name__ == "__main__":

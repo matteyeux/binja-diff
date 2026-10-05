@@ -20,13 +20,13 @@ import difflib
 import hashlib
 import logging
 import re
+import threading
 import time
 import traceback
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
-from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, ClassVar
 from collections.abc import Callable
 
 import binaryninja
@@ -38,7 +38,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterable
 
     from qbindiff import Mapping
-    from qbindiff.loader import Function as QBFunction, Program as QBProgram
+    from qbindiff.loader import Program as QBProgram
     from qbindiff.types import Addr, Idx, SimMatrix
 
 
@@ -104,6 +104,19 @@ def _anchor_names(program: QBProgram) -> dict[str, Addr]:
     return names
 
 
+class DiffCancelled(Exception):
+    """Raised from inside QBinDiff's passes when the caller asked to stop.
+
+    The passes run inside QBinDiff's generators, where the only way out is an
+    exception; ``run_diff`` turns it into the ``None`` a cancelled run returns.
+    """
+
+
+#: How many name candidates the anchor pass looks at between cancellation
+#: checks. Each costs a line alignment at most, so this is well under a second.
+_ANCHOR_CHECK_EVERY = 64
+
+
 def match_named_functions(
     sim_matrix: SimMatrix,
     primary: QBProgram,
@@ -116,6 +129,8 @@ def match_named_functions(
     primary_bv: BinaryView,
     secondary_bv: BinaryView,
     exact_pairs: set[tuple[int, int]] | None = None,
+    cancelled: Callable[[], bool] | None = None,
+    report: Callable[[str, float], None] | None = None,
 ) -> None:
     """Anchor unique, byte-identical code and cautiously use matching names.
 
@@ -128,11 +143,19 @@ def match_named_functions(
 
     This runs after feature extraction. QBinDiff's prepass can divide by zero
     when every function is anchored, while its postpass has no such problem.
+    It also runs inside the stretch where QBinDiff reports nothing, so it
+    announces itself and polls ``cancelled``: hashing every function's bytes
+    and aligning the name candidates is seconds on a large pair, and a Cancel
+    pressed then used to wait for the whole matrix.
     """
 
     from functools import lru_cache
 
     from . import align
+
+    is_cancelled = cancelled or (lambda: False)
+    if report is not None:
+        report("Anchoring identical code and names", INDETERMINATE)
 
     def code_signatures(bv: BinaryView, program: QBProgram) -> dict[int, tuple[str, bytes]]:
         signatures: dict[int, tuple[str, bytes]] = {}
@@ -180,7 +203,11 @@ def match_named_functions(
         sim_matrix[rows, cols] = 1
 
     left_signatures = code_signatures(primary_bv, primary)
+    if is_cancelled():
+        raise DiffCancelled
     right_signatures = code_signatures(secondary_bv, secondary)
+    if is_cancelled():
+        raise DiffCancelled
     same_addrs: set[int] = set()
     for addr, key in left_signatures.items():
         if right_signatures.get(addr) != key:
@@ -231,7 +258,9 @@ def match_named_functions(
 
     named = []
     secondary_names = _anchor_names(secondary)
-    for name, left_addr in _anchor_names(primary).items():
+    for index, (name, left_addr) in enumerate(_anchor_names(primary).items()):
+        if index % _ANCHOR_CHECK_EVERY == 0 and is_cancelled():
+            raise DiffCancelled
         right_addr = secondary_names.get(name)
         if right_addr is None:
             continue
@@ -296,7 +325,11 @@ def far_from_local_anchors(
     return not left[1] - margin <= secondary_addr <= right[1] + margin
 
 
-def demote_unsubstantiated_matches(result: DiffResult, exact_pairs: set[tuple[int, int]]) -> None:
+def demote_unsubstantiated_matches(
+    result: DiffResult,
+    exact_pairs: set[tuple[int, int]],
+    cancelled: Callable[[], bool] | None = None,
+) -> None:
     """Leave implausible forced matches unmatched on both sides.
 
     QBinDiff's assignment can pair every function of the smaller binary even
@@ -307,10 +340,13 @@ def demote_unsubstantiated_matches(result: DiffResult, exact_pairs: set[tuple[in
 
     from . import align
 
+    is_cancelled = cancelled or (lambda: False)
     landmarks = sorted(exact_pairs)
     kept: list[MatchRecord] = []
     removed: list[MatchRecord] = []
-    for match in result.matches:
+    for index, match in enumerate(result.matches):
+        if index % _ANCHOR_CHECK_EVERY == 0 and is_cancelled():
+            raise DiffCancelled
         if match.similarity >= 0.05 or (
             match.primary.name == match.secondary.name and not is_generated_name(match.primary.name)
         ):
@@ -379,32 +415,60 @@ class _log_bridge:
     line arrived twice — once tagged QBinDiff, once as ``INFO:root:`` from the
     scripting provider. Nothing is lost by muting: this handler forwards the
     same records, at the same levels, and the originals are restored on exit.
+
+    Diffs overlap — two tabs, or a tab and a Binary Similarity session — and the
+    snapshot has to be taken by the first one in and restored by the last one
+    out. A per-instance snapshot taken while another bridge was active recorded
+    the *muted* levels as the originals, and whichever diff finished last left
+    every root handler silenced for the rest of the process.
     """
 
+    _lock: ClassVar[threading.Lock] = threading.Lock()
+    _active: ClassVar[int] = 0
+    _handler: ClassVar[_BinjaLogHandler | None] = None
+    _previous_level: ClassVar[int] = logging.NOTSET
+    _muted: ClassVar[list[tuple[logging.Handler, int]]] = []
+
     def __init__(self, level: int = logging.INFO):
-        self._handler = _BinjaLogHandler()
-        self._handler.setFormatter(logging.Formatter("%(message)s"))
         self._level = level
-        self._previous_level: int | None = None
-        self._muted: list[tuple[logging.Handler, int]] = []
 
     def __enter__(self) -> None:
-        root = logging.getLogger()
-        self._previous_level = root.level
-        self._muted = [(handler, handler.level) for handler in root.handlers]
-        for handler, _level in self._muted:
-            handler.setLevel(logging.CRITICAL + 1)
-        root.setLevel(self._level)
-        root.addHandler(self._handler)
+        cls = type(self)
+        with cls._lock:
+            cls._active += 1
+            if cls._active > 1:
+                return
+            root = logging.getLogger()
+            handler = _BinjaLogHandler()
+            handler.setFormatter(logging.Formatter("%(message)s"))
+            cls._handler = handler
+            cls._previous_level = root.level
+            cls._muted = [(other, other.level) for other in root.handlers]
+            for other, _level in cls._muted:
+                other.setLevel(logging.CRITICAL + 1)
+            root.setLevel(self._level)
+            root.addHandler(handler)
 
     def __exit__(self, *_exc) -> None:
-        root = logging.getLogger()
-        root.removeHandler(self._handler)
-        for handler, level in self._muted:
-            handler.setLevel(level)
-        self._muted = []
-        if self._previous_level is not None:
-            root.setLevel(self._previous_level)
+        cls = type(self)
+        with cls._lock:
+            cls._active -= 1
+            if cls._active > 0:
+                return
+            root = logging.getLogger()
+            if cls._handler is not None:
+                root.removeHandler(cls._handler)
+                cls._handler = None
+            for other, level in cls._muted:
+                other.setLevel(level)
+            cls._muted = []
+            root.setLevel(cls._previous_level)
+
+
+#: QBinDiff's distance functions, by name. Spelled out so the two front ends can
+#: offer them without importing qbindiff first; test_cli checks the list against
+#: the real enum. "correlation" used to be offered and does not exist there.
+DISTANCES: tuple[str, ...] = ("haussmann", "canberra", "cosine", "euclidean")
 
 
 @dataclass
@@ -601,6 +665,11 @@ class DiffResult:
     #: Wall-clock seconds per phase, in the order they ran. Describes the run
     #: that produced this result, so a restored diff carries only its own load.
     timings: list[tuple[str, float]] = field(default_factory=list)
+    #: Names of the container parts (kexts, SEP modules) the diff covered;
+    #: empty for an ordinary binary. A container holds no code until a part is
+    #: mapped in, so a restore has to map the same parts before any address in
+    #: the result resolves to a function again.
+    scope: list[str] = field(default_factory=list)
     #: Address lookups for the table and for navigation. Mapping's own
     #: match_primary/match_secondary are linear scans, far too slow for a
     #: table that queries per row.
@@ -636,7 +705,9 @@ class DiffResult:
         )
 
     @staticmethod
-    def _refs(functions: Iterable[QBFunction]) -> list[FunctionRef]:
+    def _refs(functions: Iterable[Any]) -> list[FunctionRef]:
+        # qbindiff types the unmatched sets as graph nodes; what arrives are its
+        # Function objects, which carry the address and name read here.
         return [FunctionRef(f.addr, f.name) for f in sorted(functions, key=lambda f: f.addr)]
 
     @property
@@ -858,6 +929,7 @@ def run_diff(
         # function list, and waiting for analysis on a view that has not been
         # given its code yet would wait for nothing.
         primary_region = secondary_region = None
+        scope_names: list[str] = []
         if region_name is not None:
             from .scope import ensure_loaded, find_region
 
@@ -878,6 +950,7 @@ def run_diff(
                 else:
                     secondary_region = find_region(view, region_name)
             log_info(f"Diffing only {region_name}", "QBinDiff")
+            scope_names = [region_name]
 
         else:
             # A container holds no code until something is mapped into it, so
@@ -891,6 +964,7 @@ def run_diff(
             )
             if mirrored:
                 log_info(f"Diffing {len(mirrored)} part(s): {', '.join(mirrored)}", "QBinDiff")
+            scope_names = list(mirrored)
 
         # Before the function counts below mean anything: a view still being
         # analyzed can legitimately have none yet.
@@ -898,21 +972,6 @@ def run_diff(
             for view in (primary_bv, secondary_bv):
                 if not wait_for_analysis(view, progress=report, cancelled=is_cancelled):
                     return None
-
-        # A file Binary Ninja does not recognize still opens, as a raw view
-        # with no functions. Diffing that yields an empty result that looks
-        # like a plugin bug, so say what actually happened.
-        for label, view in (("primary", primary_bv), ("secondary", secondary_bv)):
-            if len(view.functions) == 0:
-                raise RuntimeError(
-                    f"The {label} binary ({view.file.filename}) contains no functions. "
-                    f"Binary Ninja may not recognize its format, or analysis may not "
-                    f"have run."
-                )
-
-        options = scale_options_for_size(
-            options, len(primary_bv.functions), len(secondary_bv.functions)
-        )
 
         report("Building program graphs", 0.0)
         with _timed(timings, "Building the primary graph"):
@@ -923,6 +982,28 @@ def run_diff(
             secondary = build_program(secondary_bv, secondary_region)
         if is_cancelled():
             return None
+
+        # Checked on the programs rather than the views: a scoped diff compares
+        # one part of a view, and the view's own function count says nothing
+        # about that part. A file Binary Ninja does not recognize still opens,
+        # as a raw view with no functions, and diffing that yields an empty
+        # result that looks like a plugin bug — so say what actually happened.
+        for label, view, program in (
+            ("primary", primary_bv, primary),
+            ("secondary", secondary_bv, secondary),
+        ):
+            if len(program) == 0:
+                where = f" in {region_name}" if region_name is not None else ""
+                raise RuntimeError(
+                    f"The {label} binary ({view.file.filename}) contains no functions{where}. "
+                    f"Binary Ninja may not recognize its format, or analysis may not "
+                    f"have run."
+                )
+
+        # Sized on what is actually matched. A 2k-function kext inside a view
+        # holding 10k loaded functions is a small diff, and sizing it on the
+        # view forced the large-diff sparsity onto it.
+        options = scale_options_for_size(options, len(primary), len(secondary))
 
         log_info(
             f"Diffing {len(primary)} vs {len(secondary)} functions",
@@ -941,14 +1022,36 @@ def run_diff(
             sparse_row=options.sparse_row,
         )
         exact_pairs: set[tuple[int, int]] = set()
-        differ.register_postpass(
-            partial(
-                match_named_functions,
+
+        def anchor_pass(
+            sim_matrix,
+            primary,
+            secondary,
+            primary_mapping,
+            secondary_mapping,
+            primary_features=None,
+            secondary_features=None,
+            **extra,
+        ):
+            # QBinDiff hands a postpass the two feature dicts positionally, and
+            # its protocol allows further keywords; spelled out rather than a
+            # partial so the signature says so.
+            match_named_functions(
+                sim_matrix,
+                primary,
+                secondary,
+                primary_mapping,
+                secondary_mapping,
+                primary_features,
+                secondary_features,
                 primary_bv=primary_bv,
                 secondary_bv=secondary_bv,
                 exact_pairs=exact_pairs,
+                cancelled=is_cancelled,
+                report=report,
             )
-        )
+
+        differ.register_postpass(anchor_pass)
 
         selected = feature_extractors(options.features)
         for extractor in selected:
@@ -959,22 +1062,26 @@ def run_diff(
         # Both stop reporting well before they stop working — see the labels
         # below, which are set *before* each silent stretch begins.
         phase = ""
-        with _timed(timings, "Extracting features"):
-            for step in differ.process_iterator():
-                if is_cancelled():
-                    return None
-                label, value = feature_phase(min(step / 1000.0, 1.0))
-                if label != phase:
-                    phase = label
-                    if value is INDETERMINATE:
-                        log_info(
-                            f"Feature extraction done; building the similarity matrix for "
-                            f"{len(selected)} features over {len(primary)} x "
-                            f"{len(secondary)} functions. Nothing reports progress until "
-                            f"that finishes, and it is usually the longest part of the run.",
-                            "QBinDiff",
-                        )
-                report(label, value)
+        try:
+            with _timed(timings, "Extracting features"):
+                for step in differ.process_iterator():
+                    if is_cancelled():
+                        return None
+                    label, value = feature_phase(min(step / 1000.0, 1.0))
+                    if label != phase:
+                        phase = label
+                        if value is INDETERMINATE:
+                            log_info(
+                                f"Feature extraction done; building the similarity matrix "
+                                f"for {len(selected)} features over {len(primary)} x "
+                                f"{len(secondary)} functions. Nothing reports progress "
+                                f"until that finishes, and it is usually the longest part "
+                                f"of the run.",
+                                "QBinDiff",
+                            )
+                    report(label, value)
+        except DiffCancelled:
+            return None
 
         # matching_iterator sparsifies the similarity matrix and computes the
         # squares matrix before its first yield; on a large pair that argsort
@@ -1008,8 +1115,12 @@ def run_diff(
         if mapping is None:
             return None
         result = DiffResult.build(primary_bv, secondary_bv, mapping)
-        demote_unsubstantiated_matches(result, exact_pairs)
+        try:
+            demote_unsubstantiated_matches(result, exact_pairs, cancelled=is_cancelled)
+        except DiffCancelled:
+            return None
         result.timings = timings
+        result.scope = scope_names
         return result
 
 

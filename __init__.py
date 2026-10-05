@@ -16,7 +16,7 @@ broken plugin load.
 
 from __future__ import annotations
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 from binaryninja import core_ui_enabled, log_error, log_warn
 

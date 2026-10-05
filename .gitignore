@@ -14,4 +14,13 @@ __pycache__/
 .venv*/
 
 .DS_Store
-*.json
+
+# Saved diffs land next to the binaries they describe; plugin.json is tracked.
+*.bndiff.json
+
+# Read-only upstream checkouts kept beside the plugin for reference (see
+# CLAUDE.md). Local, never committed.
+/binaryninja-api/
+/qbindiff/
+/quokka/
+/sep-binja/

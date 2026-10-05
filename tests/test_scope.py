@@ -6,7 +6,7 @@ half needs Binary Ninja and lives in test_live.py; what is here is the SEP half,
 which is derived from section names and so can be checked against sep-binja's
 naming without loading anything.
 
-    .venv-qbindiff-312/bin/python binja_diff/tests/test_scope.py
+    .venv/bin/python tests/test_scope.py
 """
 
 from __future__ import annotations
@@ -25,14 +25,7 @@ _bootstrap.install()
 from binja_diff.core import scope  # noqa: E402
 
 
-def check(label: str, condition: bool, detail: str = "") -> None:
-    status = "ok  " if condition else "FAIL"
-    print(f"  [{status}] {label}{(' -- ' + detail) if detail and not condition else ''}")
-    if not condition:
-        check.failures += 1
-
-
-check.failures = 0
+check = _bootstrap.check
 _stubs = _bootstrap.stubs()
 
 
@@ -311,28 +304,113 @@ def test_a_plain_binary_is_left_alone():
     check("nothing to mirror", scope.mirror_loaded(plain, _stubs.BinaryView("/bin/dir")) == [])
 
 
+def _function(bv, start: int, name: str):
+    """One small function at ``start``, enough for QBinDiff to extract features from."""
+
+    TT = _stubs.InstructionTextTokenType
+    tokens = [
+        _stubs.Token(TT.InstructionToken, "mov"),
+        _stubs.Token(TT.TextToken, " "),
+        _stubs.Token(TT.RegisterToken, "x0", 0),
+        _stubs.Token(TT.OperandSeparatorToken, ", "),
+        _stubs.Token(TT.IntegerToken, hex(start & 0xFF), start & 0xFF),
+    ]
+    ret = [_stubs.Token(TT.InstructionToken, "ret")]
+    block = _stubs.BasicBlock(start, [(tokens, 4), (ret, 4)])
+    function = _stubs.Function(bv, start, name, [block])
+    bv.functions.append(function)
+    return function
+
+
+def test_a_scoped_diff_is_checked_and_sized_on_the_part():
+    """The view's function count says nothing about the part being diffed.
+
+    Both the "contains no functions" guard and the size-based sparsity used
+    to read the whole view: a part with no code passed the guard and a small
+    kext inside a big view got the large-diff settings.
+    """
+
+    print("a scoped diff is checked and sized on the part, not the view")
+    from binja_diff.core import engine
+
+    primary, secondary = sep_view(), sep_view()
+    # Code in SEPOS only; SEPD is mapped but empty on both sides.
+    for bv in (primary, secondary):
+        _function(bv, 0x1100, "a")
+        _function(bv, 0x1200, "b")
+
+    try:
+        engine.run_diff(primary, secondary, region_name="SEPD")
+    except RuntimeError as exc:
+        check("an empty part is refused although the view has code", "SEPD" in str(exc), str(exc))
+    else:
+        check("an empty part is refused although the view has code", False, "no error")
+
+    sized: list[tuple[int, int]] = []
+    original = engine.scale_options_for_size
+
+    def spy(options, primary_count, secondary_count):
+        sized.append((primary_count, secondary_count))
+        return original(options, primary_count, secondary_count)
+
+    engine.scale_options_for_size = spy
+    try:
+        result = engine.run_diff(primary, secondary, region_name="SEPOS")
+    finally:
+        engine.scale_options_for_size = original
+    check("the scoped diff ran", result is not None)
+    check("sized on the part's functions", sized == [(2, 2)], f"{sized}")
+    if result is not None:
+        check("the result records its scope", result.scope == ["SEPOS"], f"{result.scope}")
+
+    with_api(None)
+    plain = _stubs.BinaryView("/tmp/plain.bin")
+    plain_other = _stubs.BinaryView("/tmp/plain2.bin")
+    for bv in (plain, plain_other):
+        _function(bv, 0x1000, "f")
+    result = engine.run_diff(plain, plain_other)
+    check("a plain binary has no scope", result is not None and result.scope == [], f"{result}")
+
+
+def test_named_parts_are_loaded_in_one_batch():
+    print("restoring a scope maps the named parts in, once")
+    api = FakeSepApi(["SEPOS", "SEPD", "AESS"])
+    with_api(api)
+    try:
+        bv = _stubs.BinaryView("/tmp/sep-firmware.bin")
+        bv.view_type = scope.SEP_VIEW
+        missing = scope.ensure_named_loaded(bv, ["SEPD", "AESS", "NOPE"])
+        check("the unknown name is reported", missing == ["NOPE"], f"{missing}")
+        check(
+            "the known ones are mapped in one call",
+            api.batches == [["SEPD", "AESS"]],
+            f"{api.batches}",
+        )
+        check("a loaded part is loaded", scope.find_region(bv, "SEPD").loaded)
+        check("nothing to load is fine", scope.ensure_named_loaded(bv, []) == [])
+    finally:
+        with_api(None)
+
+
 def main() -> int:
-    for test in (
-        test_sep_modules_are_discovered,
-        test_regions_are_matched_by_name,
-        test_functions_are_filtered_by_extent,
-        test_plain_binaries_offer_nothing,
-        test_sep_api_offers_modules_that_are_not_mapped_yet,
-        test_without_the_api_only_mapped_modules_appear,
-        test_an_unloaded_sep_module_cannot_be_conjured,
-        test_the_secondary_mirrors_whatever_the_primary_has,
-        test_an_untouched_sep_image_diffs_whole,
-        test_an_older_sep_binja_still_loads_one_at_a_time,
-        test_an_untouched_container_that_cannot_be_loaded_is_refused,
-        test_a_plain_binary_is_left_alone,
-    ):
-        test()
-    print()
-    if check.failures:
-        print(f"{check.failures} check(s) failed")
-        return 1
-    print("all checks passed")
-    return 0
+    return _bootstrap.run(
+        [
+            test_sep_modules_are_discovered,
+            test_regions_are_matched_by_name,
+            test_functions_are_filtered_by_extent,
+            test_plain_binaries_offer_nothing,
+            test_sep_api_offers_modules_that_are_not_mapped_yet,
+            test_without_the_api_only_mapped_modules_appear,
+            test_an_unloaded_sep_module_cannot_be_conjured,
+            test_the_secondary_mirrors_whatever_the_primary_has,
+            test_an_untouched_sep_image_diffs_whole,
+            test_an_older_sep_binja_still_loads_one_at_a_time,
+            test_an_untouched_container_that_cannot_be_loaded_is_refused,
+            test_a_plain_binary_is_left_alone,
+            test_a_scoped_diff_is_checked_and_sized_on_the_part,
+            test_named_parts_are_loaded_in_one_batch,
+        ]
+    )
 
 
 if __name__ == "__main__":

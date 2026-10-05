@@ -50,7 +50,7 @@ import traceback
 from binaryninja import BinaryView, log_error, log_info, log_warn
 
 from . import align
-from .engine import DiffOptions, DiffResult, run_diff
+from .engine import DISTANCES, DiffOptions, DiffResult, run_diff
 
 #: What the session and the sidebar call this provider.
 PROVIDER_NAME = "QBinDiff"
@@ -100,7 +100,7 @@ _SETTINGS: tuple[tuple[str, dict], ...] = (
             "type": "string",
             "default": DiffOptions.distance,
             "description": "Distance between feature vectors.",
-            "enum": ["haussmann", "canberra", "cosine", "euclidean", "correlation"],
+            "enum": list(DISTANCES),
         },
     ),
     (

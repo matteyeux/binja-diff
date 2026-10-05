@@ -47,6 +47,32 @@ sys.path[:] = [entry for entry in sys.path if Path(entry or ".").resolve() != HE
 #: Statuses worth printing without --all: what the reader is looking for.
 INTERESTING = ("changed", "unclassified", "offsets only")
 
+#: QBinDiff's distance functions, spelled out here because the parser runs
+#: before anything that could import qbindiff. test_cli checks the list against
+#: the real enum.
+DISTANCES = ("haussmann", "canberra", "cosine", "euclidean")
+
+
+def _ratio(text: str) -> float:
+    value = float(text)
+    if not 0.0 <= value <= 1.0:
+        raise argparse.ArgumentTypeError(f"{text} is not between 0 and 1")
+    return value
+
+
+def _positive(text: str) -> int:
+    value = int(text)
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"{text} is not a positive count")
+    return value
+
+
+def _count(text: str) -> int:
+    value = int(text)
+    if value < 0:
+        raise argparse.ArgumentTypeError(f"{text} is negative")
+    return value
+
 
 def _package():
     """Register the checkout as ``binja_diff`` and return it.
@@ -249,25 +275,39 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         "--all", action="store_true", help="list every matched pair and the unmatched functions"
     )
     parser.add_argument(
-        "--limit", type=int, default=0, metavar="N", help="print at most N pairs (0 = no limit)"
+        "--limit", type=_count, default=0, metavar="N", help="print at most N pairs (0 = no limit)"
     )
     parser.add_argument(
         "--no-classify",
         action="store_true",
         help="skip per-function comparison: matches only, much faster on a large pair",
     )
-    parser.add_argument("--quiet", "-q", action="store_true", help="no progress on stderr")
+    parser.add_argument(
+        "--quiet", "-q", action="store_true", help="no progress, and no engine warnings, on stderr"
+    )
+    parser.add_argument(
+        "--verbose", "-v", action="store_true", help="the engine's info-level log on stderr too"
+    )
 
     tuning = parser.add_argument_group("matching")
     tuning.add_argument(
         "--sparsity",
-        type=float,
+        type=_ratio,
         metavar="F",
-        help="sparsity ratio (default 0.15, raised for large binaries)",
+        help="sparsity ratio in [0, 1] (default 0.15, raised for large binaries)",
     )
-    tuning.add_argument("--tradeoff", type=float, metavar="F", help="feature/structure tradeoff")
-    tuning.add_argument("--maxiter", type=int, metavar="N", help="belief propagation iterations")
-    tuning.add_argument("--distance", metavar="NAME", help="distance function (default haussmann)")
+    tuning.add_argument(
+        "--tradeoff", type=_ratio, metavar="F", help="feature/structure tradeoff in [0, 1]"
+    )
+    tuning.add_argument(
+        "--maxiter", type=_positive, metavar="N", help="belief propagation iterations"
+    )
+    tuning.add_argument(
+        "--distance",
+        metavar="NAME",
+        choices=DISTANCES,
+        help=f"distance function (default haussmann): {', '.join(DISTANCES)}",
+    )
     tuning.add_argument(
         "--feature", action="append", default=[], metavar="KEY", help="extra feature, repeatable"
     )
@@ -282,13 +322,31 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
     try:
-        import binaryninja  # noqa: F401
+        import binaryninja
     except ImportError as exc:
         print(f"Binary Ninja is not importable: {exc}", file=sys.stderr)
         print("Run this with the interpreter Binary Ninja's API is installed in.", file=sys.stderr)
         return 1
 
-    _package()
+    package = _package()
+    reason = package.dependency_error()
+    if reason is not None:
+        print(f"error: {reason}", file=sys.stderr)
+        print(
+            "QBinDiff must be importable by this interpreter: pip install qbindiff",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Headless Binary Ninja writes its log to stderr only when stderr is a
+    # terminal. In CI, or with `2>log`, every warning the engine raises — a part
+    # missing from one side, a feature nobody knows, the large-diff memory
+    # note — would otherwise vanish, and the report would print a clean result
+    # over a quietly truncated diff.
+    if not args.quiet:
+        level = binaryninja.LogLevel.InfoLog if args.verbose else binaryninja.LogLevel.WarningLog
+        binaryninja.log_to_stderr(level)
+
     engine = importlib.import_module("binja_diff.core.engine")
     scope = importlib.import_module("binja_diff.core.scope")
     align = importlib.import_module("binja_diff.core.align")
@@ -357,7 +415,7 @@ def main(argv: list[str] | None = None) -> int:
         progress.done()
         print("cancelled", file=sys.stderr)
         return 130
-    except (RuntimeError, ValueError) as exc:
+    except (RuntimeError, ValueError, ImportError, KeyError) as exc:
         progress.done()
         print(f"error: {exc}", file=sys.stderr)
         # The engine's advice is "load it in the primary", which is what a UI

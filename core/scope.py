@@ -153,6 +153,17 @@ def available_regions(bv: BinaryView) -> list[Region]:
     return []
 
 
+def regions_by_name(bv: BinaryView) -> dict[str, Region]:
+    """Every region of ``bv``, keyed by name, enumerated once.
+
+    Enumerating regions constructs a controller and walks every image, or
+    re-scans the sections and asks sep-binja for its module list; a lookup per
+    name over hundreds of kexts made that quadratic.
+    """
+
+    return {region.name: region for region in available_regions(bv)}
+
+
 def find_region(bv: BinaryView, name: str) -> Region | None:
     """The region called ``name``, matched across the two sides of a diff.
 
@@ -160,7 +171,26 @@ def find_region(bv: BinaryView, name: str) -> Region | None:
     addresses are not.
     """
 
-    return next((region for region in available_regions(bv) if region.name == name), None)
+    return regions_by_name(bv).get(name)
+
+
+def ensure_named_loaded(bv: BinaryView, names: list[str]) -> list[str]:
+    """Map the regions called ``names`` in, analyzing once. Returns the names
+    ``bv`` has no region for.
+
+    This is what a restored diff of a container runs before any of its
+    addresses can resolve: the saved result names the parts, and the view just
+    opened holds none of them.
+    """
+
+    if not names:
+        return []
+    known = regions_by_name(bv)
+    found = [known[name] for name in names if name in known]
+    missing = [name for name in names if name not in known]
+    if found and not ensure_all_loaded(bv, found):
+        log_warn(f"Could not load every part of {bv.file.filename}", "QBinDiff")
+    return missing
 
 
 def ensure_loaded(bv: BinaryView, region: Region) -> bool:
@@ -268,11 +298,14 @@ def mirror_loaded(
         # faster and more complete than mapping them one at a time.
         _load_everything(secondary_bv)
 
+    # Enumerated once: a lookup per part over a 256-kext cache re-walked every
+    # image each time.
+    known = regions_by_name(secondary_bv)
     targets = []
     for region in loaded:
         if progress is not None:
             progress(region.name)
-        target = find_region(secondary_bv, region.name)
+        target = known.get(region.name)
         if target is None:
             log_warn(f"{region.name} is not in the secondary; skipping it", "QBinDiff")
             continue

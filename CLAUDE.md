@@ -4,21 +4,24 @@ Guidance for AI agents working in this repository.
 
 ## What this repository is
 
-`binja_diff/` is a Binary Ninja UI plugin that diffs two binaries side by side
-using QBinDiff for function matching. Everything else in the repository is a
-vendored read-only reference checkout:
+The repository root **is** the plugin package: a Binary Ninja UI plugin that
+diffs two binaries side by side using QBinDiff for function matching. Inside
+Binary Ninja it is imported under whatever its plugin folder is called; the
+tests and the CLI register it by path as `binja_diff`.
 
-| Directory | Status |
+| Path | Status |
 | --- | --- |
-| `binja_diff/` | The plugin. This is the only thing to edit. |
-| `qbindiff/` | Upstream QBinDiff source, for reference. Do not modify. |
-| `quokka/` | Upstream Quokka source, for reference. Not used at runtime. |
-| `binaryninja-api/` | Binary Ninja API source and headers, for reference. Do not modify. |
-| `.venv-qbindiff/` | Virtualenv used by the test suite. Not committed. |
+| `__init__.py`, `core/`, `ui/`, `binja-diff.py` | The plugin. This is what to edit. |
+| `tests/` | The test suite; see below. |
+| `binaryninja-api/` | Binary Ninja API source and headers, for reference. Untracked and ignored. Do not modify. |
+| `qbindiff/`, `quokka/`, `sep-binja/` | Upstream checkouts, when present, for reference only. Same status. |
+| `.venv/` | Virtualenv used by the test suite. Not committed. |
 
-Read the vendored trees freely; they are the authoritative source for API
+Read the reference trees freely; they are the authoritative source for API
 signatures, which is important because much of the Binary Ninja Python API is
-generated at build time and is not introspectable from a checkout.
+generated at build time and is not introspectable from a checkout. Clone any
+that is missing beside the plugin when you need it; `.gitignore`, `ruff.toml`
+and `ty.toml` already exclude them.
 
 ## Environment
 
@@ -44,12 +47,14 @@ Two failure modes are worth recognizing on sight, because both look like
 - **Python version mismatch.** A site-packages built for a different minor
   version is silently unimportable. It must match whatever Binary Ninja runs
   (`import sys; sys.version` in its console).
-- **Namespace shadowing.** A `qbindiff` directory sits at the repository root.
-  If the repo root lands on `sys.path` it shadows the installed package as a
-  namespace package: `import qbindiff` succeeds and every submodule fails.
+- **Namespace shadowing.** A `qbindiff` reference checkout at the repository
+  root, if the repo root lands on `sys.path`, shadows the installed package as
+  a namespace package: `import qbindiff` succeeds and every submodule fails.
 
-`dependency_error()` in `binja_diff/__init__.py` distinguishes these and names
-the cause; extend it rather than reintroducing a generic message.
+`dependency_error()` in `__init__.py` distinguishes these and names the cause;
+extend it rather than reintroducing a generic message. The CLI calls it before
+anything else and prints the answer, so a missing QBinDiff is one line there,
+not a traceback from inside `run_diff`.
 
 QBinDiff also imports `python-magic`, which dlopens the system `libmagic`. On a
 minimal Linux image that library is often absent and surfaces as
@@ -59,8 +64,17 @@ minimal Linux image that library is often absent and surfaces as
 
 ```bash
 PYTHONPATH="/Applications/Binary Ninja.app/Contents/Resources/python" \
-  .venv/bin/python binja_diff/tests/run_all.py
+  .venv/bin/python tests/run_all.py
 ```
+
+Setting that virtualenv up is `python3 -m venv .venv && .venv/bin/pip install
+-r requirements.txt pytest ruff ty`; on a Python QBinDiff has no wheel for
+(anything past 3.12) pip builds it from source, which works given a C++
+compiler. The stubbed tier also runs under pytest (`.venv/bin/python -m pytest
+tests`): `tests/conftest.py` installs the stubs first and leaves `test_live.py`
+to `run_all.py`. `check()` raises, so a failing check fails the test either
+way — it used to count failures and print them, which under pytest meant every
+module passed whatever happened.
 
 There are two tiers.
 
@@ -76,14 +90,17 @@ against real Binary Ninja rendering, and the stub encoded what the author
 assumed the tokens looked like rather than what they are.
 
 `test_backend.py`, `test_align.py`, `test_engine.py`, `test_persist.py`,
-`test_symbols.py`, `test_scope.py`, `test_cli.py` and `test_background.py` install a stub
-`binaryninja` module into `sys.modules` and run the **real** QBinDiff against
-it, including a full end-to-end diff with belief propagation. They cover the
-backend's object model, instruction and operand extraction, block and line
-alignment, `DiffTask`'s completion, cancellation and failure paths, the
-saved-diff format, what porting symbols refuses to do, container scoping, and
-the CLI's argument contract and report. These need no Binary Ninja
-installation.
+`test_symbols.py`, `test_scope.py`, `test_cli.py`, `test_similarity.py` and
+`test_background.py` install a stub `binaryninja` module into `sys.modules`
+and run the **real** QBinDiff against it, including a full end-to-end diff with
+belief propagation. They cover the backend's object model, instruction and
+operand extraction, block and line alignment, the tasks' completion,
+cancellation and failure paths, the saved-diff format and a container restore,
+what porting symbols refuses to do, container scoping, the similarity
+provider's adapter logic, and the CLI's argument contract and report. These
+need no Binary Ninja installation. `test_invariants.py` is static: it parses
+`core/` and `ui/` to enforce the import-order, no-Qt-in-core and
+callback-name rules below, and checks `__version__` against `plugin.json`.
 
 `test_live.py` drives the **real** Binary Ninja API over real binaries. It
 prints SKIP and exits 0 wherever Binary Ninja is not importable. It is the only
@@ -99,17 +116,27 @@ of the diff classifier, and cheap:
 printf 'int check(int x){return x>42?x*3:x+7;}\nint main(){return check(10);}\n' > /tmp/a.c
 sed 's/42/99/' /tmp/a.c > /tmp/b.c
 gcc -O0 -o /tmp/a /tmp/a.c && gcc -O0 -o /tmp/b /tmp/b.c
-.venv/bin/python binja_diff/tests/test_live.py /tmp/a /tmp/b
+.venv/bin/python tests/test_live.py /tmp/a /tmp/b
 ```
 
-Two things to know about the stubbed harness:
+Three things to know about the stubbed harness:
 
-- `binja_diff/__init__.py` imports `binaryninja` at module scope, so the stub
-  must be registered before any `binja_diff` import. That is what
-  `tests/bootstrap.py` is for; load it by path, not through the package.
+- `__init__.py` imports `binaryninja` at module scope, so the stub must be
+  registered before any `binja_diff` import. That is what `tests/bootstrap.py`
+  is for; load it by path, not through the package, and take the stub classes
+  from `bootstrap.stubs()` rather than importing `stub_binaryninja` a second
+  time — two loads are two distinct enum classes.
 - The stub only models the API surface the plugin actually uses. When you touch
   a new Binary Ninja API, extend `tests/stub_binaryninja.py` to match, and
-  check the real signature against `binaryninja-api/` first.
+  check the real signature against `binaryninja-api/` first. Its
+  `BackgroundTaskThread` runs `run()` inline from `start()`, so a task's
+  callbacks have fired by the time `start()` returns; its text lines carry
+  tokens and addresses, so the classifier takes the same path it takes in
+  Binary Ninja. A test that builds lines from strings should type them the way
+  the renderer does (`test_align.insn`: `{...}` is an annotation, `//` a
+  comment).
+- sep-binja's loader is looked up as `sys.modules["sep_binja_api"]`, so a test
+  publishes a fake there (`test_scope.FakeSepApi`) and removes it afterwards.
 
 Also lint and type-check before finishing:
 
@@ -148,7 +175,7 @@ hyphenated so it cannot be imported at all, and it drops its own directory from
 same trick as `tests/bootstrap.py`), which needs no path entry. Same family as
 the `qbindiff/` namespace shadowing above.
 
-**Import order in `ui/`.** Every module under `binja_diff/ui/` imports
+**Import order in `ui/`.** Every module under `ui/` imports
 `binaryninjaui` before `PySide6`. Binary Ninja ships a custom PySide6 build
 ABI-matched to its own `libbinaryninjaui`; importing them in the wrong order
 loads the wrong PySide6 and hard-crashes the process rather than raising. Never
@@ -174,6 +201,20 @@ Ninja and never Qt; anything read from the theme (`getThemeColor` is a UI call)
 is resolved on the UI thread first and passed in, as `graphpane.line_highlights()`
 is.
 
+**A symbol port writes to that view, so it counts too.** While `_port_task`
+runs, `start_diff`, `_restore` and `close_secondary` all refuse (`_busy_with`),
+the Open, Load and Close buttons are disabled, and the `destroyed` handler
+cancels and joins it (bounded by `_PORT_JOIN_SECONDS`) before closing the view.
+It used to be guarded only against a second port.
+
+**Destroy the widgets bound to the view before closing it.** `LinearView` and
+`FlowGraphWidget` are both `BinaryDataNotification` listeners on the view they
+are constructed with (`binaryninja-api/ui/flowgraphwidget.h`), and a listener
+left on a closed view is a crash at the next notification. `_release_bound_views`
+destroys both the native linear panes and the graph panes (`GraphDiffTab.release_views`,
+which rebuilds them empty) and runs before `_close_secondary` on every path.
+The graph panes used to survive, which only showed when nothing replaced them.
+
 **Closing that view is what releases the lock on a `.bndb`**, and three things
 have to line up or the user cannot reopen their own database:
 
@@ -189,6 +230,15 @@ have to line up or the user cannot reopen their own database:
 - Anything that drops the reference — `_reset_to_dropzone` after a cancelled or
   failed run — must clear `_owned` too, or the registry closes a view the task
   already closed.
+- **A tab closed mid-diff.** The running `DiffTask` or `RestoreTask` sits in
+  `_owned["task"]`, and `_release_holder` cancels it (never joins it: the silent
+  stretches are minutes long and this is the UI thread). The task closes the
+  view it loaded when it notices; a result that lands anyway reaches `_on_done`,
+  which checks `_released()` (the holder's flag, else `shiboken6.isValid`) and
+  closes the view instead of touching a widget that is gone. Register the view
+  in `_OPEN_SECONDARIES` *before* touching any widget there: it used to come
+  after `busy.finish()`, which raised on a deleted widget and left the view in
+  nobody's hands.
 
 `close_secondary()` exists so the lock can be released without closing the tab;
 the diff goes with it, because every pane points at that view.
@@ -206,6 +256,13 @@ clean `None` when cancelled, so pressing Cancel never surfaces as an error.
 **An unrecognized file still opens**, as a raw view with zero functions, rather
 than failing. `run_diff()` rejects empty views explicitly, because otherwise a
 corrupt input produces an empty diff that looks like a plugin bug.
+
+**Headless Binary Ninja logs to stderr only when stderr is a terminal.** In CI,
+or with `2>log`, every `log_warn` the engine raises — a part missing from one
+side, an unknown feature, the large-diff memory note — vanishes, and the CLI
+printed a clean report over a quietly truncated diff. `binja-diff.py` therefore
+calls `log_to_stderr(WarningLog)` itself (`InfoLog` with `--verbose`, nothing
+with `--quiet`).
 
 **`BinaryView.executable` is False for custom views** unless they override
 `perform_is_executable()`; the API requires that override for executable custom
@@ -289,6 +346,21 @@ that — and `run_diff` sets "Preparing the matcher" before entering
 `matching_iterator`. Both report `INDETERMINATE`, which the progress panel
 renders as a busy bar rather than one frozen at 100%.
 
+The anchoring postpass (`match_named_functions`) runs inside the first silent
+stretch, so it reports "Anchoring identical code and names" itself and polls
+`cancelled` between its stages, raising `DiffCancelled`, which `run_diff` turns
+into the `None` a cancelled run returns. `demote_unsubstantiated_matches` does
+the same. Nothing can interrupt QBinDiff's own matrix work, but a Cancel pressed
+during ours no longer waits for it.
+
+**`_log_bridge` is shared, not per run.** It lowers the root logger and mutes
+the other handlers for the duration of a diff, and two diffs overlap whenever
+two tabs run or a Binary Similarity session runs beside one. The snapshot of
+the original levels is therefore taken by the first bridge in and restored by
+the last one out, under a lock with a count; a per-instance snapshot recorded
+the *muted* levels as the originals and left the console silenced for the rest
+of the process.
+
 ## Architecture
 
 ```mermaid
@@ -310,6 +382,10 @@ flowchart TD
         dropzone["dropzone.py"]
         progresspanel["progresspanel.py"]
         scopedialog["scopedialog.py"]
+        nativelinear["nativelinear.py: two native LinearViews"]
+        difflayer["difflayer.py: RenderLayer painting the diff"]
+        cursorsync["cursorsync.py: follow the cursor across panes"]
+        themeMod["theme.py: colours from the Binary Ninja theme"]
         backgroundMod["background.py: worker threads, no Qt"]
         levelpicker["levelpicker.py: remembered view choice"]
     end
@@ -335,11 +411,21 @@ flowchart TD
     backgroundMod --> graphpane
     levelpicker --> textpane
     levelpicker --> graphpane
+    levelpicker --> nativelinear
+    alignMod --> nativelinear
+    alignMod --> difflayer
+    difflayer --> nativelinear
+    cursorsync --> nativelinear
+    cursorsync --> graphpane
+    themeMod --> matchtable
+    themeMod --> textpane
+    themeMod --> graphpane
+    diffview --> nativelinear
 ```
 
 The plugin talks to QBinDiff through `Program.from_backend()`, which accepts an
 `AbstractProgramBackend`. That is the whole integration point, and it is why no
-change to the vendored `qbindiff/` is needed.
+change to QBinDiff itself is needed.
 
 QBinDiff matches functions only. Basic block and line alignment are ours, in
 `core/align.py`, computed lazily for the selected function pair.
@@ -385,6 +471,11 @@ sparsity rises just enough, reaching exactly 0.6 at the threshold, so no diff
 below 10k functions is less accurate or more expensive than before. Above 10k
 the 0.99 row-wise switch is unchanged.
 
+`engine.DISTANCES` is the list of QBinDiff distance names both front ends
+offer; the CLI keeps a copy (its parser runs before anything can import
+qbindiff) and `test_cli` checks both against the real enum. "correlation" was
+offered for a while and does not exist in QBinDiff.
+
 ### A DiffResult holds records, not qbindiff objects
 
 `DiffResult` copies the address, name, similarity and confidence out of each
@@ -428,6 +519,14 @@ Three constraints worth knowing before touching it:
   is not ours or is newer than `VERSION`, because the metadata store and a
   `*.json` file are both places where someone else's data can turn up. Keep
   additive changes tolerant (`data.get`) rather than bumping `VERSION`.
+- **A container diff saves its scope.** `DiffResult.scope` names the kexts or
+  SEP modules the diff covered (`region_name`, or what `mirror_loaded`
+  mirrored) and `SavedDiff` carries it as the additive `scope` key. A container
+  holds no code until a part is mapped in, so `RestoreTask._restore_scope` maps
+  those parts into *both* views (`scope.ensure_named_loaded`, one batch, one
+  analysis) and waits for analysis before `to_result`; without it every saved
+  address resolved to nothing and the whole table read as missing. A part the
+  file no longer has fails the restore by name.
 
 ### Diffing one kext, or one SEP module
 
@@ -487,7 +586,16 @@ itself and does not.
 
 **Regions are matched by name, never by address.** The picker runs against the
 primary alone, before the second binary is opened — which is the point, since
-offering the choice must not require analyzing 268 MB twice.
+offering the choice must not require analyzing 268 MB twice. Enumerate them
+once per operation (`regions_by_name`): a lookup per part constructs a
+controller and walks every image, which over 256 kexts was quadratic.
+
+**Size and sanity-check the diff on the programs, not the views.** `run_diff`
+builds the two scoped `Program`s first, then rejects an empty one ("contains no
+functions in AppleSEPManager") and calls `scale_options_for_size` on their
+lengths. Reading `len(bv.functions)` instead gave a 2k-function kext inside a
+view with 10k loaded functions the large-diff sparsity, and let an empty part
+through the guard.
 
 **"Everything" cannot mean "leave both views alone."** A container holds no
 code until something maps it in, and the secondary is opened by the plugin
@@ -782,13 +890,28 @@ preserve:
   showing the table is what must not come back: that means disassembling both
   binaries in full first. `MatchTableModel.set_result` cancels the pass and
   clears the cache — porting symbols changes call-site text, and therefore some
-  verdicts.
+  verdicts. The verdict (`_verdict`) carries the tooltip text too, built from
+  the rows while they exist; `explain()` used to align the pair again on hover,
+  on the UI thread. A pair that renders nothing when painting asks goes into
+  `_unrendered` and is not asked again per repaint; the background pass retries
+  whatever came back `None` once, at the end (`_retry`). Row colours are
+  resolved from the theme once (`_row_color`), and a batch repaints only the
+  rows it concerns (`_row_of`).
 - **Sorting and filtering read the cache only** (`cached_status`), never
   classify. Both ask about every row at once, which on the UI thread hangs
   exactly as long as the eager version would. Unclassified rows sort after every
   verdict, and a status filter grows as batches land. The proxy's
   `dynamicSortFilter` is off, so a batch never re-sorts rows out from under the
-  reader; `_on_classified` re-applies only a status filter.
+  reader; `_on_classified` re-applies only a status filter, and re-sorts
+  **once**, when the pass finishes, if the sort column is a verdict column —
+  keeping the current row in view. With dynamic sorting off a model reset also
+  leaves the proxy in source order while the header still shows a sort, so
+  `MatchTable.set_result` sorts explicitly by the header and re-selects the
+  pair that was current (a port refreshes the result and must not jump to row
+  0). The header's indicator starts on Status ascending, which is the order a
+  fresh table was always in: unclassified rows tie and fall back to QBinDiff's
+  score. The `UserRole` key is computed per column; building all seven to index
+  one multiplied every sort by seven.
 
 `FunctionStatus.UNKNOWN` ("unclassified") is the escape hatch above
 `MAX_CLASSIFY_INSTRUCTIONS`; keep it, or one enormous function stalls painting.
@@ -808,6 +931,24 @@ was accepted unconditionally, and *every* line of both blocks then classified as
 a difference — a two-line source change repainted the whole function. Two builds
 of the same source agree far more on what instructions say than on graph shape.
 `test_align.test_block_alignment_cases` pins the loop-body/epilogue case.
+
+Each block's text is normalized once (`_normalized_blocks`) and shared by both
+pairing passes, and a matched `BlockPair` records the `FunctionStatus` its
+lines got (`grade`) when it is made. `summarize_blocks` reads that grade; it
+used to align every changed pair's lines a second time, after
+`_blocks_identical` had already done so. `align_lines` likewise extracts each
+line's text once and indexes it, rather than walking the tokens for the filter,
+the key and the grading separately.
+
+### Each tab remembers the pair it shows
+
+`DiffView._refresh_current_tab` runs on every tab switch and asks the current
+tab for the selected pair again. Each tab keeps `align.render_key()` of what it
+last delivered (`_shown`) and returns early for the same pair in the same view;
+a Graph/Linear toggle on a big function used to lay out both graphs again.
+`_reload` (a view change) clears `_shown` before asking, and so do `clear`,
+`set_views` and `release_views`. Functions are keyed by view and start, not by
+object: the API hands out a fresh wrapper per lookup.
 
 ### The Linear tab is Binary Ninja's own view, painted by a render layer
 

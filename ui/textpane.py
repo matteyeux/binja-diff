@@ -40,6 +40,7 @@ from ..core.align import (
     anchor_row,
     function_lines,
     line_address,
+    render_key,
 )
 from . import theme
 from .background import LatestOnly
@@ -277,6 +278,8 @@ class TextDiffTab(QWidget):
         self._renderer = LatestOnly("Rendering the linear diff")
         #: The last pair asked for, so switching the view can re-render it.
         self._pair: tuple = (None, None, None, None)
+        #: What is on screen, so asking for the same pair again is free.
+        self._shown: tuple | None = None
         self._syncing = False
         self._rows: list[AlignedRow] = []
         #: Row indices that differ, for next/previous navigation.
@@ -441,16 +444,20 @@ class TextDiffTab(QWidget):
     def _reload(self) -> None:
         """Re-render the same pair in the newly chosen view, keeping the place."""
 
+        self._shown = None
         if any(func is not None for func in self._pair[1::2]):
             self.show_pair(*self._pair, anchor=self._top_address())
 
     def show_pair(self, left_bv, left_func, right_bv, right_func, anchor=None) -> None:
+        if self._shown is not None and self._shown == render_key(left_func, right_func, self.level):
+            return
         self._pair = (left_bv, left_func, right_bv, right_func)
         if left_func is None and right_func is None:
             self.clear()
             return
 
         level = self.level
+        key = render_key(left_func, right_func, level)
         self.summary.setText("Rendering\u2026")
         self.position.setText("")
         self.prev_button.setEnabled(False)
@@ -465,6 +472,7 @@ class TextDiffTab(QWidget):
         def deliver(rendered) -> None:
             rows, left_title, right_title = rendered
             self._show_rows(rows, left_title, right_title, anchor)
+            self._shown = key
 
         def fail(exc: BaseException) -> None:
             self.splitter.setEnabled(True)
@@ -485,6 +493,7 @@ class TextDiffTab(QWidget):
 
     def clear(self) -> None:
         self._renderer.cancel()
+        self._shown = None
         self._pair = (None, None, None, None)
         self._rows = []
         self.splitter.setEnabled(True)

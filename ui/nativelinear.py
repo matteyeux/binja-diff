@@ -27,7 +27,7 @@ from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QSplitter, QVBox
 
 from binaryninja import FunctionViewType, HighlightColor, log_warn
 
-from ..core.align import LineStatus, RenderLevel, address_pairs, line_address
+from ..core.align import LineStatus, RenderLevel, address_pairs, line_address, render_key
 from . import difflayer, theme
 from .background import LatestOnly
 from .cursorsync import CursorSync
@@ -168,6 +168,8 @@ class NativeLinearTab(QWidget):
         #: Bumped per shown pair, so a pending layer check for an old one drops.
         self._generation = 0
         self._pair: tuple = (None, None, None, None)
+        #: What is on screen, so asking for the same pair again is free.
+        self._shown: tuple | None = None
         self._painted: list[tuple] = []
         self._rows: list = []
         self._change_rows: list[int] = []
@@ -236,6 +238,7 @@ class NativeLinearTab(QWidget):
     def set_views(self, left_bv, right_bv) -> None:
         """Build both widgets; a ``LinearView`` binds its BinaryView for life."""
 
+        self._shown = None
         frame = ViewFrame.viewFrameForWidget(self)
         self.left.bind(left_bv, frame)
         self.right.bind(right_bv, frame)
@@ -253,6 +256,7 @@ class NativeLinearTab(QWidget):
         """Drop both widgets, before the views they hold are closed."""
 
         self._renderer.cancel()
+        self._shown = None
         self._unpaint()
         self.left.release()
         self.right.release()
@@ -276,16 +280,20 @@ class NativeLinearTab(QWidget):
         self._painted = []
 
     def _reload(self) -> None:
+        self._shown = None
         if any(func is not None for func in self._pair[1::2]):
             self.show_pair(*self._pair, anchor=self.left.current_offset())
 
     def show_pair(self, left_bv, left_func, right_bv, right_func, anchor=None) -> None:
+        if self._shown is not None and self._shown == render_key(left_func, right_func, self.level):
+            return
         self._pair = (left_bv, left_func, right_bv, right_func)
         if left_func is None and right_func is None:
             self.clear()
             return
 
         level = self.level
+        key = render_key(left_func, right_func, level)
         colors, gap_color = _palette()
         self.summary.setText("Rendering…")
         self.position.setText("")
@@ -323,6 +331,7 @@ class NativeLinearTab(QWidget):
             self.right.show_function(right_func, level, right_at)
             self._index_changes()
             self._check_layer([self.left, self.right])
+            self._shown = key
 
         def fail(exc: BaseException) -> None:
             self.summary.setText(f"could not render: {exc}")
@@ -423,6 +432,7 @@ class NativeLinearTab(QWidget):
 
     def clear(self) -> None:
         self._renderer.cancel()
+        self._shown = None
         self._unpaint()
         self._pair = (None, None, None, None)
         self._rows = []

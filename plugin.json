@@ -9,6 +9,11 @@
    "api": [
       "python3"
    ],
+   "dependencies": {
+      "pip": [
+         "qbindiff>=1.2.3"
+      ]
+   },
    "description": "Binary Ninja diffing plugin",
    "longdescription": "Diffs the currently open binary against a second file dropped onto the view. Function matching is performed by QBinDiff (Quarkslab) driven by a native Binary Ninja loader backend, so no intermediate export file (Quokka, BinExport) is required. Results are presented as a sortable function match table plus side-by-side panes for control flow graphs, assembly, and all three Binary Ninja IL levels. Also registers QBinDiff as a provider for Binary Ninja's Binary Similarity sessions, where it can run alongside Google BinDiff and WARP and be weighed against them by a resolver; that half works headlessly and needs no UI.",
    "license": {

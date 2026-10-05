@@ -40,7 +40,9 @@ from .engine import (
     MatchRecord,
     SecondaryTask,
     format_duration,
+    wait_for_analysis,
 )
+from .scope import ensure_named_loaded
 
 #: Identifies the payload wherever it is found. A metadata key can be read by
 #: any plugin, and a .json file can be handed to anything.
@@ -129,6 +131,10 @@ class SavedDiff:
     #: The DiffOptions the run used, for provenance. Never fed back into a
     #: restore — nothing is recomputed — but it answers "what produced this?".
     options: dict = field(default_factory=dict)
+    #: Container parts the diff covered. Unlike ``options`` this *is* fed back
+    #: into a restore: the parts have to be mapped in again before the saved
+    #: addresses point at any function. Empty for an ordinary binary.
+    scope: list[str] = field(default_factory=list)
     version: int = VERSION
 
     # -- conversion --------------------------------------------------------
@@ -144,6 +150,7 @@ class SavedDiff:
             secondary_unmatched=list(result.secondary_unmatched),
             created=datetime.now(timezone.utc).isoformat(timespec="seconds"),
             options=asdict(options) if options is not None else {},
+            scope=list(result.scope),
         )
 
     def to_result(self, primary_bv: BinaryView, secondary_bv: BinaryView) -> DiffResult:
@@ -154,6 +161,7 @@ class SavedDiff:
             matches=list(self.matches),
             primary_unmatched=list(self.primary_unmatched),
             secondary_unmatched=list(self.secondary_unmatched),
+            scope=list(self.scope),
         )
 
     # -- serialization -----------------------------------------------------
@@ -164,6 +172,7 @@ class SavedDiff:
             "version": self.version,
             "created": self.created,
             "options": self.options,
+            "scope": list(self.scope),
             "similarity": round(self.similarity, 6),
             "primary": self.primary.to_dict(),
             "secondary": self.secondary.to_dict(),
@@ -214,6 +223,7 @@ class SavedDiff:
                 secondary_unmatched=_refs(data.get("secondary_unmatched", [])),
                 created=str(data.get("created", "")),
                 options=data.get("options") or {},
+                scope=[str(name) for name in data.get("scope") or []],
                 version=version,
             )
         except (TypeError, ValueError, IndexError, KeyError) as exc:
@@ -375,6 +385,10 @@ class RestoreTask(SecondaryTask):
                 self._cancel(secondary_bv)
                 return
 
+            if not self._restore_scope(secondary_bv):
+                self._cancel(secondary_bv)
+                return
+
             # The primary was checked before the task started; the secondary
             # could only be inspected once it was open. Neither is fatal, so
             # this is a warning rather than a refusal to restore.
@@ -398,3 +412,29 @@ class RestoreTask(SecondaryTask):
             self._on_done(result)
         except Exception as exc:
             self._fail(secondary_bv, exc)
+
+    def _restore_scope(self, secondary_bv: BinaryView) -> bool:
+        """Map the saved parts back into both views. ``False`` if cancelled.
+
+        A saved diff of one kext or SEP module names that part; the view the
+        restore just opened holds none of it, and the primary may have had it
+        unloaded since. Without this every address in the result resolved to
+        nothing and the whole table read as missing. Both sides are mapped
+        before either is analyzed, for the reason ``ensure_all_loaded`` gives.
+        """
+
+        names = self._saved.scope
+        if not names:
+            return True
+        self._report_text(f"Loading {', '.join(names)}")
+        for label, view in (("primary", self.primary_bv), ("secondary", secondary_bv)):
+            missing = ensure_named_loaded(view, names)
+            if missing:
+                raise RuntimeError(
+                    f"The {label} binary has no part named {', '.join(missing)}; the saved "
+                    f"diff covered it, so it cannot be restored against this file."
+                )
+        for view in (self.primary_bv, secondary_bv):
+            if not wait_for_analysis(view, progress=self._report, cancelled=lambda: self.cancelled):
+                return False
+        return True

@@ -19,7 +19,8 @@ Pseudo C, Pseudo Objective-C or Pseudo Rust.
 - Save and restore diffs from the BNDB or json file
 - Whole-diff summary, filled in the background: changed, offsets only, identical,
   unmatched — click a segment to filter
-- Overview strip beside the linear diff marking where the changes are
+- Overview strip beside the linear diff marking where the changes are (in the
+  text fallback used where the native linear view is unavailable)
 - Double-click a match to jump to it in the primary binary
 - Port function names from one binary to the other
 - Diff a single kext from a kernelcache, or one SEP module
@@ -27,10 +28,30 @@ Pseudo C, Pseudo Objective-C or Pseudo Rust.
 
 ## Requirements
 
-- Python 3.10+
-- [QBinDiff](https://github.com/quarkslab/qbindiff)
+- Binary Ninja 4.x (build 10271 or newer), running Python 3.10 to 3.12
+- [QBinDiff](https://github.com/quarkslab/qbindiff) >= 1.2.3, importable from
+  Binary Ninja's Python
 
 On Linux, QBinDiff also loads the system `libmagic` through `python-magic`, you may need to install `libmagic1` on Debian-based systems
+
+### Installing QBinDiff
+
+QBinDiff pins numpy >= 2 and pulls in scipy and scikit-learn, so it is best kept
+out of Binary Ninja's bundled interpreter. Its wheels exist for CPython
+3.10 to 3.12 only; anywhere else pip builds it from source and needs a C++
+compiler, meson and cython. The Plugin Manager tries `pip install qbindiff`
+for you; if that fails, or you installed by hand, make a virtualenv for the
+exact Python Binary Ninja runs (`import sys; sys.version` in its console):
+
+```bash
+python3.12 -m venv ~/.binja-diff-venv
+~/.binja-diff-venv/bin/pip install qbindiff
+```
+
+Then point **Settings > Python > Python Virtual Environment Site-Packages** at
+`~/.binja-diff-venv/lib/python3.12/site-packages` and restart Binary Ninja.
+If the plugin still cannot load QBinDiff, the log says why: a wheel built for
+another Python version, or a `qbindiff` directory shadowing the package.
 
 ### Linux aarch64 is not supported
 
@@ -59,7 +80,26 @@ Drag a binary anywhere onto the drop zone, or click **Choose file...**.
 Expect this to take a while on real firmware. Matching is quadratic in the
 number of functions. sep-firmware M5 26.5 against 26.5.2 takes about 38 minutes.
 Saving the result is worth it: restoring one costs only the reload of the second
-binary.
+binary. A saved diff of one kext or SEP module records which part it covered
+and maps it back in on restore.
+
+### Headless CLI
+
+`binja-diff.py` runs the same engine from a shell. It needs a headless
+licence and an interpreter that has both Binary Ninja's API and QBinDiff:
+
+```bash
+PYTHONPATH="/Applications/Binary Ninja.app/Contents/Resources/python" \
+  python3 binja-diff.py a.bin b.bin
+python3 binja-diff.py --list kernelcache            # what is in it
+python3 binja-diff.py --part AppleSEPManager kc.a kc.b
+python3 binja-diff.py --json out.bndiff.json a.bndb b.bndb
+```
+
+Engine warnings go to stderr even when it is not a terminal; `--quiet`
+silences them, `--verbose` adds the engine's info log. `--all` lists every
+pair, `--limit N` caps the list, `--no-classify` skips the per-function
+comparison on a large pair.
 
 ### Binary Similarity
 
@@ -93,6 +133,7 @@ binary those are most of the lines, and colouring them hides the real change.
 | offsets only | only addresses, immediates, stack offsets or register choice differ |
 | changed | at least one real instruction difference |
 | unclassified | too large to classify while scrolling; open it to see |
+| only in primary / secondary | no counterpart was matched on the other side |
 
 The match table marks **verify pair** when the graph matcher and line comparison
 both find little shared code. Use **Show: Verify pair** to review these pairs.
@@ -111,9 +152,26 @@ on both sides.
 | `+` | present only in the secondary |
 | `-` | present only in the primary |
 
+Comment lines are shown but never compared.
+
 ### Dev
 
-Ensure you run pre-commit before contributing
+Install the pre-commit hooks before contributing; they run ruff and ty with the
+configs in the repo root:
+
 ```bash
-uv run pre-commit install
+uvx pre-commit install      # or: pipx run pre-commit install
 ```
+
+The stubbed tests need only a virtualenv with QBinDiff (no Binary Ninja), and
+run either way:
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt pytest
+.venv/bin/python tests/run_all.py --no-live
+.venv/bin/python -m pytest tests
+```
+
+`tests/test_live.py` drives a real Binary Ninja and skips itself when the API
+is not importable; put the app's Python on `PYTHONPATH` to run it. See
+`CLAUDE.md` for the full picture.

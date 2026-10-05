@@ -131,6 +131,21 @@ class RenderLevel(NamedTuple):
         return getattr(LinearViewObject, factory_name)(func, settings)
 
 
+def render_key(left_func, right_func, level: RenderLevel) -> tuple:
+    """What a rendered pair is, for a pane deciding whether it has it already.
+
+    Functions are identified by view and start rather than by object: the API
+    hands out a fresh wrapper per lookup, so two requests for the same pair
+    never compare equal by identity.
+    """
+
+    return (
+        None if left_func is None else (id(left_func.view), left_func.start),
+        None if right_func is None else (id(right_func.view), right_func.start),
+        level.name,
+    )
+
+
 def render_level(name: str | RenderLevel) -> RenderLevel:
     """Resolve a display name — an IL level or a language — to a `RenderLevel`."""
 
@@ -191,7 +206,11 @@ _LOCAL_NAME = re.compile(r"\b(var|arg)_[0-9a-fA-F]+\b")
 #: on how it modelled the data there — one 16-byte variable renders
 #: `data_5598e0+8`, two 8-byte ones render `data_5598e8` — and both name the
 #: same byte. Resolved to that byte so the two spellings compare equal.
-_ADDRESS_OFFSET = re.compile(r"0x([0-9a-fA-F]+)\+(0x)?([0-9a-fA-F]+)\b")
+#: The offset is decimal without a `0x` prefix and hex with one, so the two
+#: forms are separate groups: a single hex-digit class parsed as decimal
+#: raised on `0x1000+c`, and one such line took a whole classification batch
+#: down with it.
+_ADDRESS_OFFSET = re.compile(r"0x([0-9a-fA-F]+)\+(?:0x([0-9a-fA-F]+)|([0-9]+))\b")
 
 
 #: An address written as an index into a variable: `data_10001fce0[0x20]` is
@@ -230,6 +249,12 @@ def normalize_line(text: str) -> str:
     return _HEX.sub("0x?", text)
 
 
+def _resolve_offset(match: re.Match) -> str:
+    base = int(match.group(1), 16)
+    offset = int(match.group(2), 16) if match.group(2) is not None else int(match.group(3))
+    return f"0x{base + offset:x}"
+
+
 def compare_line(text: str) -> str:
     """Conservative normalization, used to decide a row is *equal*.
 
@@ -246,9 +271,7 @@ def compare_line(text: str) -> str:
     """
 
     text = _ADDRESS_NAME.sub(lambda m: f"0x{m.group(1)}", text)
-    text = _ADDRESS_OFFSET.sub(
-        lambda m: f"0x{int(m.group(1), 16) + int(m.group(3), 16 if m.group(2) else 10):x}", text
-    )
+    text = _ADDRESS_OFFSET.sub(_resolve_offset, text)
     return _WS.sub(" ", text).strip()
 
 
@@ -542,6 +565,11 @@ class BlockPair:
     left_addr: int | None
     right_addr: int | None
     status: BlockStatus
+    #: How the lines of a matched pair compare, by the grading the panes use.
+    #: Recorded when the pair is made, so the block summary and anything else
+    #: asking the same question read it rather than align the lines again.
+    #: ``None`` for a block on one side only.
+    grade: FunctionStatus | None = None
 
 
 @dataclass
@@ -682,7 +710,16 @@ def _block_graph(blocks) -> networkx.DiGraph:
 # --------------------------------------------------------------------------
 
 
-def _anchor_identical_blocks(left_blocks, right_blocks) -> dict[int, int]:
+def _normalized_blocks(blocks) -> dict[int, list[str]]:
+    """Each block's code as normalized lines, keyed by start. Computed once per
+    alignment: both pairing passes read it, and normalizing is the cost."""
+
+    return {block.start: [normalize_line(text) for text in block_text(block)] for block in blocks}
+
+
+def _anchor_identical_blocks(
+    left_text: dict[int, list[str]], right_text: dict[int, list[str]]
+) -> dict[int, int]:
     """Pair blocks whose normalized instruction text is identical.
 
     This is the same idea as QBinDiff's ``compute_basic_block_match`` (a
@@ -690,15 +727,12 @@ def _anchor_identical_blocks(left_blocks, right_blocks) -> dict[int, int]:
     works at every IL level rather than only on machine instructions.
     """
 
-    def signature(block) -> tuple[str, ...]:
-        return tuple(sorted(normalize_line(line) for line in block_text(block)))
-
     left_by_sig: dict[tuple[str, ...], list[int]] = {}
-    for block in left_blocks:
-        left_by_sig.setdefault(signature(block), []).append(block.start)
+    for addr, lines in left_text.items():
+        left_by_sig.setdefault(tuple(sorted(lines)), []).append(addr)
     right_by_sig: dict[tuple[str, ...], list[int]] = {}
-    for block in right_blocks:
-        right_by_sig.setdefault(signature(block), []).append(block.start)
+    for addr, lines in right_text.items():
+        right_by_sig.setdefault(tuple(sorted(lines)), []).append(addr)
 
     anchors: dict[int, int] = {}
     for sig, left_addrs in left_by_sig.items():
@@ -726,19 +760,25 @@ def align_blocks(
 
     left_by_addr = {b.start: b for b in left_blocks}
     right_by_addr = {b.start: b for b in right_blocks}
+    left_text = _normalized_blocks(left_blocks)
+    right_text = _normalized_blocks(right_blocks)
 
-    matched = _anchor_identical_blocks(left_blocks, right_blocks)
+    matched = _anchor_identical_blocks(left_text, right_text)
 
     remaining_left = [a for a in left_by_addr if a not in matched]
     remaining_right = [a for a in right_by_addr if a not in set(matched.values())]
 
     if remaining_left and remaining_right:
-        matched.update(_align_remaining(left_blocks, right_blocks, remaining_left, remaining_right))
+        matched.update(
+            _align_remaining(
+                left_blocks, right_blocks, left_text, right_text, remaining_left, remaining_right
+            )
+        )
 
     for left_addr, right_addr in matched.items():
-        identical = _blocks_identical(left_by_addr[left_addr], right_by_addr[right_addr])
-        status = BlockStatus.IDENTICAL if identical else BlockStatus.CHANGED
-        alignment.pairs.append(BlockPair(left_addr, right_addr, status))
+        grade = _grade_blocks(left_by_addr[left_addr], right_by_addr[right_addr])
+        status = BlockStatus.IDENTICAL if grade is FunctionStatus.IDENTICAL else BlockStatus.CHANGED
+        alignment.pairs.append(BlockPair(left_addr, right_addr, status, grade))
         alignment.left_status[left_addr] = status
         alignment.right_status[right_addr] = status
         alignment.left_to_right[left_addr] = right_addr
@@ -762,7 +802,12 @@ _TEXT_MATCH_FLOOR = 0.5
 
 
 def _align_remaining(
-    left_blocks, right_blocks, remaining_left: list[int], remaining_right: list[int]
+    left_blocks,
+    right_blocks,
+    left_text: dict[int, list[str]],
+    right_text: dict[int, list[str]],
+    remaining_left: list[int],
+    remaining_right: list[int],
 ) -> dict[int, int]:
     """Pair the blocks that exact matching left over.
 
@@ -774,7 +819,7 @@ def _align_remaining(
     the instructions say than on the exact shape of the graph.
     """
 
-    matched = _greedy_text_match(left_blocks, right_blocks, remaining_left, remaining_right)
+    matched = _greedy_text_match(left_text, right_text, remaining_left, remaining_right)
 
     left_over = [a for a in remaining_left if a not in matched]
     paired = set(matched.values())
@@ -813,23 +858,18 @@ def _structural_match(
 
 
 def _greedy_text_match(
-    left_blocks, right_blocks, remaining_left: list[int], remaining_right: list[int]
+    left_text: dict[int, list[str]],
+    right_text: dict[int, list[str]],
+    remaining_left: list[int],
+    remaining_right: list[int],
 ) -> dict[int, int]:
     """Pair leftover blocks by normalized instruction-text similarity, best first."""
 
-    left_by_addr = {b.start: b for b in left_blocks}
-    right_by_addr = {b.start: b for b in right_blocks}
-
-    # Normalize once per block, not once per candidate pair.
-    def normalized(by_addr, addrs):
-        return {a: [normalize_line(t) for t in block_text(by_addr[a])] for a in addrs}
-
-    left_text = normalized(left_by_addr, remaining_left)
-    right_text = normalized(right_by_addr, remaining_right)
-
     scored = []
-    for left_addr, left_lines in left_text.items():
-        for right_addr, right_lines in right_text.items():
+    for left_addr in remaining_left:
+        left_lines = left_text[left_addr]
+        for right_addr in remaining_right:
+            right_lines = right_text[right_addr]
             matcher = difflib.SequenceMatcher(None, left_lines, right_lines, autojunk=False)
             # quick_ratio only bounds the real ratio from above, which is enough
             # to reject but not to rank; ranking is exactly what this does.
@@ -852,8 +892,8 @@ def _greedy_text_match(
     return matched
 
 
-def _blocks_identical(left_block, right_block) -> bool:
-    """Whether two blocks read the same, by the rules the lines are graded on.
+def _grade_blocks(left_block, right_block) -> FunctionStatus:
+    """How two blocks compare, by the rules the lines are graded on.
 
     Anything looser than :func:`align_lines` lets a block be called changed
     while none of its lines is, and the graph then reports a change it has
@@ -861,7 +901,11 @@ def _blocks_identical(left_block, right_block) -> bool:
     """
 
     rows = align_lines(list(left_block.disassembly_text), list(right_block.disassembly_text))
-    return classify_rows(rows) is FunctionStatus.IDENTICAL
+    return classify_rows(rows)
+
+
+def _blocks_identical(left_block, right_block) -> bool:
+    return _grade_blocks(left_block, right_block) is FunctionStatus.IDENTICAL
 
 
 #: Block counts, in the order a summary reads them.
@@ -894,12 +938,12 @@ def summarize_blocks(alignment: BlockAlignment, left_blocks, right_blocks) -> di
         elif pair.status is BlockStatus.IDENTICAL:
             counts["identical"] += 1
         else:
-            rows = align_lines(
-                list(left_by_addr[pair.left_addr].disassembly_text),
-                list(right_by_addr[pair.right_addr].disassembly_text),
-            )
-            minor = classify_rows(rows) is FunctionStatus.MINOR
-            counts["operands only" if minor else "changed"] += 1
+            # The grade was taken when the pair was made; a pair built by hand
+            # without one is graded here, once.
+            grade = pair.grade
+            if grade is None:
+                grade = _grade_blocks(left_by_addr[pair.left_addr], right_by_addr[pair.right_addr])
+            counts["operands only" if grade is FunctionStatus.MINOR else "changed"] += 1
     return counts
 
 
@@ -927,19 +971,24 @@ def align_lines(
     ``__str__``.
     """
 
+    # Each line's code is extracted once: walking the tokens is what the
+    # filter, the alignment key and the grading below all start from.
+    left_texts = [instruction_text(line, key) for line in left_lines]
+    right_texts = [instruction_text(line, key) for line in right_lines]
     # Lines with no code on them take no part in the alignment, or a comment on
     # one side reads as an added instruction. They are woven back in below.
-    left_code = [i for i, line in enumerate(left_lines) if instruction_text(line, key).strip()]
-    right_code = [i for i, line in enumerate(right_lines) if instruction_text(line, key).strip()]
-    left_keys = [normalize_line(instruction_text(left_lines[i], key)) for i in left_code]
-    right_keys = [normalize_line(instruction_text(right_lines[i], key)) for i in right_code]
+    left_code = [i for i, text in enumerate(left_texts) if text.strip()]
+    right_code = [i for i, text in enumerate(right_texts) if text.strip()]
+    left_keys = [normalize_line(left_texts[i]) for i in left_code]
+    right_keys = [normalize_line(right_texts[i]) for i in right_code]
 
-    def classify(left, right) -> LineStatus:
+    def classify(left_index: int, right_index: int) -> LineStatus:
         """Grade a matched pair, from identical through to structurally different."""
 
+        left, right = left_lines[left_index], right_lines[right_index]
         # Compared without annotations: those say what the renderer knows about
         # the code, not what the code is, and one view knows more than the other.
-        left_text, right_text = instruction_text(left, key), instruction_text(right, key)
+        left_text, right_text = left_texts[left_index], right_texts[right_index]
         if left_text == right_text:
             return LineStatus.EQUAL
         if compare_line(left_text) == compare_line(right_text):
@@ -993,14 +1042,13 @@ def align_lines(
             next_left if left_index is None else left_index,
             next_right if right_index is None else right_index,
         )
-        left = None if left_index is None else left_lines[left_index]
-        right = None if right_index is None else right_lines[right_index]
-        if left is None:
-            rows.append(AlignedRow(None, right, LineStatus.ADDED))
-        elif right is None:
-            rows.append(AlignedRow(left, None, LineStatus.REMOVED))
-        else:
-            rows.append(AlignedRow(left, right, classify(left, right)))
+        if left_index is not None and right_index is not None:
+            status = classify(left_index, right_index)
+            rows.append(AlignedRow(left_lines[left_index], right_lines[right_index], status))
+        elif right_index is not None:
+            rows.append(AlignedRow(None, right_lines[right_index], LineStatus.ADDED))
+        elif left_index is not None:
+            rows.append(AlignedRow(left_lines[left_index], None, LineStatus.REMOVED))
         next_left = next_left if left_index is None else left_index + 1
         next_right = next_right if right_index is None else right_index + 1
     commentary(len(left_lines), len(right_lines))

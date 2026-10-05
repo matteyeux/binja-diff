@@ -90,6 +90,12 @@ def _stop_workers(workers) -> None:
         worker.wait()
 
 
+#: How long the destroyed handler waits for a symbol port to stop. Renames
+#: check for cancellation between functions, so this is seconds at most; the
+#: bound is there so a hung save cannot freeze the UI thread for good.
+_PORT_JOIN_SECONDS = 10.0
+
+
 def _release_holder(holder: dict, *_args) -> None:
     """Close whatever a view was holding, given only its holder.
 
@@ -97,9 +103,28 @@ def _release_holder(holder: dict, *_args) -> None:
     on ``QWidget.destroyed``, and a bound method of the widget being destroyed
     is exactly what PySide may never call — the Python wrapper is invalidated
     as the C++ object goes away. Nothing here touches the widget; the workers
-    are plain Python objects, not Qt ones.
+    and tasks are plain Python objects, not Qt ones.
+
+    A diff still running is cancelled, not joined: its silent stretches are
+    minutes long and this runs on the UI thread. The task closes the view it
+    loaded when it notices, and its completion callbacks check ``released``
+    before touching a widget that no longer exists — without that, a tab closed
+    mid-diff left the view it had just opened in nobody's hands, and a `.bndb`
+    locked for the rest of the session. A port is joined, bounded: it writes
+    to the view about to be closed.
     """
 
+    holder["released"] = True
+    task = holder.get("task")
+    if task is not None:
+        task.cancel()
+    port = holder.get("port")
+    if port is not None:
+        port.cancel()
+        try:
+            port.join(_PORT_JOIN_SECONDS)
+        except Exception:
+            pass
     _stop_workers(holder.get("workers", ()))
     _close_secondary(holder.get("bv"))
     holder["bv"] = None
@@ -162,7 +187,7 @@ class DiffView(QWidget, View):
         self.setAcceptDrops(True)
         #: What this view has open, reachable without the widget. See
         #: _release_holder for why the destroyed handler must not touch self.
-        self._owned: dict = {"bv": None}
+        self._owned: dict = {"bv": None, "task": None, "port": None, "released": False}
         # shiboken objects never see __del__, so release the secondary here.
         self.destroyed.connect(partial(_release_holder, self._owned))
 
@@ -203,7 +228,15 @@ class DiffView(QWidget, View):
                 log_warn(f"Native linear diff unavailable, using text: {exc}", "QBinDiff")
         return TextDiffTab(self.tabs)
 
-    def _release_linear_views(self) -> None:
+    def _release_bound_views(self) -> None:
+        """Destroy every widget bound to the secondary view, before it is closed.
+
+        ``FlowGraphWidget`` and ``LinearView`` both register as listeners on the
+        view they are constructed with, and a listener left on a closed view is
+        a crash the next time the core notifies it.
+        """
+
+        self.graph_tab.release_views()
         release = getattr(self.text_tab, "release_views", None)
         if release is not None:
             release()
@@ -320,8 +353,8 @@ class DiffView(QWidget, View):
         self.dropzone.browse()
 
     def start_diff(self, path_or_bv) -> None:
-        if self._task is not None:
-            QMessageBox.information(self, "Binary diff", "A diff is already running.")
+        if self._busy_with():
+            QMessageBox.information(self, "Binary diff", f"{self._busy_with()} is already running.")
             return
         if self.data is None:
             return
@@ -379,8 +412,36 @@ class DiffView(QWidget, View):
         self._region_name = dialog.region_name()
         return True
 
+    def _busy_with(self) -> str | None:
+        """What is running that a new diff, restore or close would collide with."""
+
+        if self._task is not None:
+            return "A diff"
+        if self._port_task is not None:
+            return "A symbol port"
+        return None
+
+    def _released(self) -> bool:
+        """Whether the widget is gone, as seen from a callback that outlived it.
+
+        The tasks post their completion to the main thread, and a tab closed
+        mid-diff is destroyed before that lands. The holder's flag is set by the
+        destroyed handler; shiboken's view of the wrapper covers the case where
+        that handler never ran.
+        """
+
+        if self._owned.get("released"):
+            return True
+        try:
+            import shiboken6
+
+            return not shiboken6.isValid(self)
+        except Exception:
+            return False
+
     def _start_task(self, task) -> None:
         self._task = task
+        self._owned["task"] = task
         self._owns_secondary = task.owns_secondary
         # Nothing that would start a second run stays clickable: start_diff and
         # _restore both refuse while one is going, and a dialog saying so is a
@@ -415,16 +476,25 @@ class DiffView(QWidget, View):
 
     def _finish_task(self) -> None:
         self._task = None
+        self._owned["task"] = None
         self.busy.finish()
         self._set_sources_enabled(True)
 
     def _on_done(self, result: DiffResult, note: str = "") -> None:
-        self._finish_task()
+        if self._released():
+            # The tab went away while the diff ran. Nothing is left to show it
+            # in, and the view the task opened is now ours alone to close.
+            if self._owns_secondary:
+                _close_secondary(result.secondary_bv)
+            return
+        # Bookkeeping before any widget is touched, so the view is registered
+        # even if drawing the result raises.
         self.result = result
         self.secondary_bv = result.secondary_bv
         if self._owns_secondary:
             _OPEN_SECONDARIES.add(result.secondary_bv)
             self._owned["bv"] = result.secondary_bv
+        self._finish_task()
         self.secondary_label.setText(f"Secondary: {result.secondary_bv.file.filename}")
         self.status.setText(
             f"{note}similarity {result.similarity:.3f} in {format_duration(result.duration)}"
@@ -450,9 +520,13 @@ class DiffView(QWidget, View):
         self.table.set_result(None)
         self.graph_tab.clear()
         self.text_tab.clear()
-        self._release_linear_views()
+        self._release_bound_views()
 
     def _reset_to_dropzone(self, status: str) -> None:
+        if self._released():
+            # The task already closed what it had opened; there is no widget
+            # left to reset.
+            return
         self._finish_task()
         # The task closed whatever it had opened; drop the reference with the
         # ownership flag, or _release_secondary would later close it twice.
@@ -485,8 +559,9 @@ class DiffView(QWidget, View):
 
         if self.secondary_bv is not None and self._owns_secondary:
             _stop_workers(self._owned.get("workers", ()))
-            # A native linear view listens to the view it holds.
-            self._release_linear_views()
+            # Both the native linear views and the flow graph widgets are
+            # BinaryDataNotification listeners on the view they hold.
+            self._release_bound_views()
             _close_secondary(self.secondary_bv)
         self._owned["bv"] = None
         self.secondary_bv = None
@@ -502,7 +577,7 @@ class DiffView(QWidget, View):
         `.bndb` held open here cannot be opened anywhere else.
         """
 
-        if self._task is not None or self.secondary_bv is None:
+        if self._busy_with() or self.secondary_bv is None:
             return
         name = os.path.basename(self.secondary_bv.file.filename or "")
         self._release_secondary()
@@ -615,6 +690,12 @@ class DiffView(QWidget, View):
         )
         self._port_target_name = os.path.basename(target.file.filename or "")
         self._port_task = task
+        self._owned["port"] = task
+        # It writes to the secondary, so nothing that closes or replaces that
+        # view may run until it is done: the buttons go grey, and the three
+        # entry points refuse as well.
+        self._set_sources_enabled(False)
+        self.close_button.setEnabled(False)
         task.start()
 
     def _confirm_overwrite(self, count: int) -> bool:
@@ -630,8 +711,16 @@ class DiffView(QWidget, View):
             == QMessageBox.Yes
         )
 
-    def _on_ported(self, options, plan, applied: int) -> None:
+    def _finish_port(self) -> None:
         self._port_task = None
+        self._owned["port"] = None
+        self._set_sources_enabled(True)
+        self.close_button.setEnabled(self._owns_secondary and self.secondary_bv is not None)
+
+    def _on_ported(self, options, plan, applied: int) -> None:
+        if self._released():
+            return
+        self._finish_port()
         self.status.setText(f"ported {applied} symbol(s)")
         if applied == 0:
             QMessageBox.information(self, "Port symbols", f"Nothing to port.\n\n{plan.summary()}")
@@ -659,7 +748,9 @@ class DiffView(QWidget, View):
         self.table.set_result(self.result)
 
     def _on_port_failed(self, message: str) -> None:
-        self._port_task = None
+        if self._released():
+            return
+        self._finish_port()
         self.status.setText("port failed")
         QMessageBox.critical(self, "Port symbols", message)
 
@@ -743,8 +834,8 @@ class DiffView(QWidget, View):
     def _restore(self, saved: persist.SavedDiff) -> None:
         """Bring a saved diff back, re-opening the secondary binary it names."""
 
-        if self._task is not None:
-            QMessageBox.information(self, "Binary diff", "A diff is already running.")
+        if self._busy_with():
+            QMessageBox.information(self, "Binary diff", f"{self._busy_with()} is already running.")
             return
         if self.data is None:
             return

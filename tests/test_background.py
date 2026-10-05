@@ -28,14 +28,7 @@ _bootstrap.install()
 from binja_diff.ui import background  # noqa: E402
 
 
-def check(label: str, condition: bool, detail: str = "") -> None:
-    status = "ok  " if condition else "FAIL"
-    print(f"  [{status}] {label}{(' -- ' + detail) if detail and not condition else ''}")
-    if not condition:
-        check.failures += 1
-
-
-check.failures = 0
+check = _bootstrap.check
 
 
 def test_only_the_latest_render_is_delivered():
@@ -150,20 +143,15 @@ def test_stopping_a_batch_waits_for_the_worker():
 
 
 def main() -> int:
-    for test in (
-        test_only_the_latest_render_is_delivered,
-        test_a_failed_render_reports_instead_of_delivering,
-        test_cancel_drops_what_is_in_flight,
-        test_batches_cover_every_item_and_finish_once,
-        test_stopping_a_batch_waits_for_the_worker,
-    ):
-        test()
-    print()
-    if check.failures:
-        print(f"{check.failures} check(s) failed")
-        return 1
-    print("all checks passed")
-    return 0
+    return _bootstrap.run(
+        [
+            test_only_the_latest_render_is_delivered,
+            test_a_failed_render_reports_instead_of_delivering,
+            test_cancel_drops_what_is_in_flight,
+            test_batches_cover_every_item_and_finish_once,
+            test_stopping_a_batch_waits_for_the_worker,
+        ]
+    )
 
 
 if __name__ == "__main__":

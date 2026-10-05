@@ -4,12 +4,13 @@ These are the paths that otherwise only surface in the GUI: a cancelled or
 failed run must still release the secondary binary and notify the UI, or the
 view is left stuck with its Cancel button showing.
 
-    .venv-qbindiff/bin/python binja_diff/tests/test_engine.py
+    .venv/bin/python tests/test_engine.py
 """
 
 from __future__ import annotations
 
 import importlib.util
+import tempfile
 from pathlib import Path
 
 _spec = importlib.util.spec_from_file_location(
@@ -23,14 +24,7 @@ _bootstrap.install()
 from binja_diff.core import engine  # noqa: E402
 
 
-def check(label: str, condition: bool, detail: str = "") -> None:
-    status = "ok  " if condition else "FAIL"
-    print(f"  [{status}] {label}{(' -- ' + detail) if detail and not condition else ''}")
-    if not condition:
-        check.failures += 1
-
-
-check.failures = 0
+check = _bootstrap.check
 
 
 def fake_mapping():
@@ -85,23 +79,16 @@ class Harness:
         self.diff_result = diff_result
         self.raise_in_diff = raise_in_diff
 
-        # Built by hand, bypassing __init__, because BackgroundTaskThread is
-        # stubbed out. Every field DiffTask.run touches has to be set here —
-        # adding one to the class without adding it below fails every test in
-        # this module with an AttributeError.
-        self.task = engine.DiffTask.__new__(engine.DiffTask)
-        self.task.primary_bv = object()
-        self.task._secondary = "/tmp/secondary"
-        self.task._options = engine.DiffOptions()
-        self.task.owns_secondary = True
-        self.task.load_timings = []
-        self.task._region_name = None
-        self.task.cancelled = False
-        self.task.progress = ""
-        self.task._on_done = lambda r: self.events.append("done")
-        self.task._on_error = lambda m: self.events.append(f"error:{m}")
-        self.task._on_cancelled = lambda: self.events.append("cancelled")
-        self.task._on_progress = None
+        # Constructed the normal way: the stub's BackgroundTaskThread is a
+        # class with the real one's attributes, so the constructor and the
+        # callbacks are wired exactly as the UI wires them.
+        self.task = engine.DiffTask(
+            object(),
+            "/tmp/secondary",
+            on_done=lambda r: self.events.append("done"),
+            on_error=lambda m: self.events.append(f"error:{m}"),
+            on_cancelled=lambda: self.events.append("cancelled"),
+        )
 
     def run(self) -> None:
         original_load, original_diff = engine.load_secondary, engine.run_diff
@@ -120,7 +107,7 @@ class Harness:
 
         engine.load_secondary, engine.run_diff = fake_load, fake_diff
         try:
-            self.task.run()
+            self.task.start()
         finally:
             engine.load_secondary, engine.run_diff = original_load, original_diff
 
@@ -167,6 +154,7 @@ def test_success_keeps_secondary():
     harness.run()
     check("done reported", harness.events == ["done"], f"got {harness.events}")
     check("secondary kept open for the UI", not harness.loaded.file.closed)
+    check("the task reports itself finished", harness.task.finished)
 
 
 def test_borrowed_secondary_never_closed():
@@ -235,6 +223,56 @@ def test_database_detection():
     check("raw binary", not engine.is_database("/bin/ls"))
     check("bndb in the middle", not engine.is_database("/tmp/x.bndb.bak"))
     check("empty", not engine.is_database(""))
+
+
+def test_empty_views_are_refused():
+    """A file Binary Ninja does not recognize opens as a raw view with no
+    functions; diffing it would produce an empty result that looks like a bug."""
+
+    print("a view with no functions is refused with a reason")
+    stubs = _bootstrap.stubs()
+    empty = stubs.BinaryView("/tmp/garbage.bin")
+    other = stubs.BinaryView("/tmp/other.bin")
+    TT = stubs.InstructionTextTokenType
+    block = stubs.BasicBlock(0x1000, [([stubs.Token(TT.InstructionToken, "ret")], 4)])
+    other.functions.append(stubs.Function(other, 0x1000, "f", [block]))
+    for label, primary, secondary in (("primary", empty, other), ("secondary", other, empty)):
+        try:
+            engine.run_diff(primary, secondary)
+        except RuntimeError as exc:
+            check(
+                f"an empty {label} is refused",
+                label in str(exc) and "garbage" in str(exc),
+                str(exc),
+            )
+        else:
+            check(f"an empty {label} is refused", False, "no error")
+
+
+def test_cancelled_load_is_not_an_error():
+    """Returning False from load()'s progress callback aborts the load, which
+    binaryninja.load reports as a generic failure. Cancelling is not an error."""
+
+    print("a cancelled load returns None rather than raising")
+    import binaryninja
+
+    original = binaryninja.load
+
+    def aborting_load(path, update_analysis=False, progress_func=None, **_kwargs):
+        if progress_func is not None and not progress_func(1, 2):
+            raise Exception("Unable to create new BinaryView")
+        return _bootstrap.stubs().BinaryView(path)
+
+    binaryninja.load = aborting_load
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".bndb") as handle:
+            cancelled = engine.load_secondary(handle.name, cancelled=lambda: True)
+            check("cancelled load is None", cancelled is None, f"{cancelled!r}")
+            loaded = engine.load_secondary(handle.name)
+            check("an uncancelled load returns the view", loaded is not None)
+            check("and analyzes it", loaded is not None and loaded.analysis_waits == 1)
+    finally:
+        binaryninja.load = original
 
 
 def test_load_missing_file():
@@ -361,6 +399,7 @@ def test_wait_for_analysis():
         Progress(State.DisassembleState, 1, 4),
         Progress(State.AnalyzeState, 3, 4),
     )
+    poll = engine.ANALYSIS_POLL_SECONDS
     engine.ANALYSIS_POLL_SECONDS = 0.0
     try:
         done = engine.wait_for_analysis(
@@ -386,7 +425,7 @@ def test_wait_for_analysis():
         )
         check("no blocking wait after cancel", cancelling.analysis_waits == 0)
     finally:
-        engine.ANALYSIS_POLL_SECONDS = 0.2
+        engine.ANALYSIS_POLL_SECONDS = poll
 
 
 def test_log_bridge():
@@ -425,6 +464,28 @@ def test_log_bridge():
         check("root level restored", root.level == logging.WARNING)
         logging.warning("after the bridge")
         check("console handler usable again", "after the bridge" in console.stream.getvalue())
+
+        # Two diffs at once — two tabs, or a tab and a similarity session. The
+        # second bridge used to snapshot the first one's muted handlers as the
+        # originals, and whichever finished last left the console silenced.
+        forwarded.clear()
+        console.stream.truncate(0)
+        console.stream.seek(0)
+        with engine._log_bridge():
+            with engine._log_bridge():
+                logging.info("inner")
+            logging.info("outer")
+            check(
+                "inner exit leaves the bridge up", forwarded == ["inner", "outer"], f"{forwarded}"
+            )
+        check("root level restored after overlap", root.level == logging.WARNING, f"{root.level}")
+        check(
+            "console handler level restored after overlap",
+            console.level == logging.NOTSET,
+            f"{console.level}",
+        )
+        logging.warning("after both")
+        check("console usable after overlap", "after both" in console.stream.getvalue())
     finally:
         engine._BinjaLogHandler._LEVELS = original_levels
         root.removeHandler(console)
@@ -477,31 +538,28 @@ def test_phase_timings():
 
 
 def main() -> int:
-    for test in (
-        test_cancel_before_diff,
-        test_cancel_during_diff,
-        test_failure,
-        test_success_keeps_secondary,
-        test_borrowed_secondary_never_closed,
-        test_progress_reporting,
-        test_feature_phase_labels,
-        test_database_detection,
-        test_load_missing_file,
-        test_sparsity_scaling,
-        test_feature_selection,
-        test_result_indexing,
-        test_wait_for_analysis,
-        test_log_bridge,
-        test_duration_formatting,
-        test_phase_timings,
-    ):
-        test()
-    print()
-    if check.failures:
-        print(f"{check.failures} check(s) failed")
-        return 1
-    print("all checks passed")
-    return 0
+    return _bootstrap.run(
+        [
+            test_cancel_before_diff,
+            test_cancel_during_diff,
+            test_failure,
+            test_success_keeps_secondary,
+            test_borrowed_secondary_never_closed,
+            test_progress_reporting,
+            test_feature_phase_labels,
+            test_database_detection,
+            test_empty_views_are_refused,
+            test_cancelled_load_is_not_an_error,
+            test_load_missing_file,
+            test_sparsity_scaling,
+            test_feature_selection,
+            test_result_indexing,
+            test_wait_for_analysis,
+            test_log_bridge,
+            test_duration_formatting,
+            test_phase_timings,
+        ]
+    )
 
 
 if __name__ == "__main__":

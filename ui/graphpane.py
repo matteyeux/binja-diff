@@ -41,6 +41,7 @@ from ..core.align import (
     format_block_summary,
     function_instruction_lines,
     il_basic_blocks,
+    render_key,
     summarize_blocks,
 )
 from . import theme
@@ -154,6 +155,9 @@ class GraphDiffTab(QWidget):
         self._renderer = LatestOnly("Rendering the graph diff")
         self._left_func = None
         self._right_func = None
+        #: What the panes currently show, so coming back to this tab for the
+        #: same pair does not lay both graphs out again. See show_pair.
+        self._shown: tuple | None = None
         self.sync = CursorSync(
             self,
             lambda side: self._pane(side).graph.getCurrentOffset(),
@@ -212,31 +216,62 @@ class GraphDiffTab(QWidget):
     def set_views(self, left_bv, right_bv) -> None:
         """Rebuild the graph widgets; they bind a BinaryView at construction."""
 
-        index = self.splitter.indexOf(self.left)
-        self.left.setParent(None)
-        self.left = GraphPane(self.splitter, left_bv, "Primary")
-        self.splitter.insertWidget(index, self.left)
-        self.sync.watch(self.left.graph, "left")
+        self._shown = None
+        sizes = self.splitter.sizes()
+        self.left = self._replace_pane(self.left, left_bv, "Primary", "left")
+        self.right = self._replace_pane(self.right, right_bv, "Secondary", "right")
+        # The reader's split survives a new result; it used to be reset.
+        if any(sizes):
+            self.splitter.setSizes(sizes)
 
-        index = self.splitter.indexOf(self.right)
-        self.right.setParent(None)
-        self.right = GraphPane(self.splitter, right_bv, "Secondary")
-        self.splitter.insertWidget(index, self.right)
-        self.sync.watch(self.right.graph, "right")
-        self.splitter.setSizes([1, 1])
+    def release_views(self) -> None:
+        """Destroy the graph widgets now, before the view they hold is closed.
+
+        A ``FlowGraphWidget`` is a ``BinaryDataNotification`` listener on its
+        view, exactly like ``LinearView``; left alive across ``file.close()`` it
+        is a crash waiting for the next notification. The panes are rebuilt
+        empty so the tab stays usable.
+        """
+
+        self._renderer.cancel()
+        self._shown = None
+        self.left = self._replace_pane(self.left, None, "Primary", "left")
+        self.right = self._replace_pane(self.right, None, "Secondary", "right")
+
+    def _replace_pane(self, old: GraphPane, bv, title: str, side: str) -> GraphPane:
+        index = self.splitter.indexOf(old)
+        old.hide()
+        old.setParent(None)
+        try:
+            import shiboken6
+
+            shiboken6.delete(old)
+        except Exception:
+            old.deleteLater()
+        pane = GraphPane(self.splitter, bv, title)
+        self.splitter.insertWidget(index, pane)
+        self.sync.watch(pane.graph, side)
+        return pane
 
     def show_pair(self, left_func, right_func) -> None:
+        # Switching tabs asks for the current pair again; if it is on screen in
+        # the current view already there is nothing to do, and a full layout of
+        # two graphs is what "nothing" used to cost.
+        if self._shown is not None and self._shown == render_key(left_func, right_func, self.level):
+            return
         self._left_func = left_func
         self._right_func = right_func
         self._reload()
 
     def _reload(self) -> None:
+        self._shown = None
         left_func, right_func = self._left_func, self._right_func
         if left_func is None and right_func is None:
             self.clear()
             return
 
         level = self.level
+        key = render_key(left_func, right_func, level)
         self._set_titles()
         self.summary.setText("Rendering\u2026")
         self.splitter.setEnabled(False)
@@ -248,6 +283,7 @@ class GraphDiffTab(QWidget):
             self.left.show_graph(left_graph)
             self.right.show_graph(right_graph)
             self.splitter.setEnabled(True)
+            self._shown = key
 
         def fail(exc: BaseException) -> None:
             self.splitter.setEnabled(True)
@@ -274,6 +310,7 @@ class GraphDiffTab(QWidget):
 
     def clear(self) -> None:
         self._renderer.cancel()
+        self._shown = None
         self.sync.set_pairs([])
         self._left_func = None
         self._right_func = None

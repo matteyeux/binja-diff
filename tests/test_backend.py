@@ -2,7 +2,7 @@
 
 Run with the project virtualenv:
 
-    .venv-qbindiff/bin/python binja_diff/tests/test_backend.py
+    .venv/bin/python tests/test_backend.py
 """
 
 from __future__ import annotations
@@ -90,14 +90,7 @@ def build_view(name: str, *, extra_instruction: bool = False) -> BinaryView:
     return bv
 
 
-def check(label: str, condition: bool, detail: str = "") -> None:
-    status = "ok  " if condition else "FAIL"
-    print(f"  [{status}] {label}{(' -- ' + detail) if detail and not condition else ''}")
-    if not condition:
-        check.failures += 1
-
-
-check.failures = 0
+check = _bootstrap.check
 
 
 def test_backend_shape():
@@ -184,6 +177,7 @@ def test_full_diff():
 
     mapping = differ.mapping
     check("mapping produced", mapping is not None)
+    assert mapping is not None
     check("matches found", mapping.nb_match > 0, f"got {mapping.nb_match}")
     matched = {(m.primary.addr, m.secondary.addr) for m in mapping}
     check("main matched to main", (0x1000, 0x1000) in matched, f"got {sorted(matched)}")
@@ -218,7 +212,7 @@ def test_import_calls_feature():
     check("same key as ImpName", ImportCalls.key == ImpName.key == "imp")
     check(
         "the import is counted",
-        dict(collector.get("imp") or {}) == {"printf": 1},
+        dict((collector.get("imp") or {}).items()) == {"printf": 1},
         f"got {collector.get('imp')}",
     )
 
@@ -408,6 +402,36 @@ def test_weak_pair_demoted_only_with_local_contradiction():
     )
 
 
+def test_cancel_during_the_anchor_pass():
+    """The anchor pass runs inside QBinDiff's silent stretch, where nothing
+    used to poll for cancellation: Cancel then waited for the whole matrix."""
+
+    print("cancelling during the anchor pass stops the diff")
+    from binja_diff.core import engine
+
+    primary_bv = build_named_view("primary", {0x1000: "encrypt", 0x2000: "decrypt"})
+    secondary_bv = build_named_view("secondary", {0x1000: "decrypt", 0x2000: "encrypt"})
+
+    labels: list[str] = []
+    state = {"cancel": False}
+
+    def progress(label: str, fraction: float) -> None:
+        labels.append(label)
+        if label == "Anchoring identical code and names":
+            state["cancel"] = True
+
+    result = engine.run_diff(
+        primary_bv, secondary_bv, progress=progress, cancelled=lambda: state["cancel"]
+    )
+    check(
+        "the anchor pass announces itself",
+        "Anchoring identical code and names" in labels,
+        f"{labels}",
+    )
+    check("a cancel noticed there ends the run", result is None)
+    check("and nothing after it reported", "Matching functions" not in labels, f"{labels}")
+
+
 def test_name_anchor_end_to_end():
     print("name anchors override address order in run_diff")
     from binja_diff.core import engine
@@ -501,26 +525,22 @@ def test_block_alignment():
 
 
 def main() -> int:
-    for test in (
-        test_backend_shape,
-        test_instruction_level,
-        test_full_diff,
-        test_import_calls_feature,
-        test_instr_group_features,
-        test_name_anchor_pass,
-        test_exact_code_anchor_and_bad_name,
-        test_weak_pair_demoted_only_with_local_contradiction,
-        test_name_anchor_end_to_end,
-        test_line_alignment,
-        test_block_alignment,
-    ):
-        test()
-    print()
-    if check.failures:
-        print(f"{check.failures} check(s) failed")
-        return 1
-    print("all checks passed")
-    return 0
+    return _bootstrap.run(
+        [
+            test_backend_shape,
+            test_instruction_level,
+            test_full_diff,
+            test_import_calls_feature,
+            test_instr_group_features,
+            test_name_anchor_pass,
+            test_exact_code_anchor_and_bad_name,
+            test_weak_pair_demoted_only_with_local_contradiction,
+            test_cancel_during_the_anchor_pass,
+            test_name_anchor_end_to_end,
+            test_line_alignment,
+            test_block_alignment,
+        ]
+    )
 
 
 if __name__ == "__main__":

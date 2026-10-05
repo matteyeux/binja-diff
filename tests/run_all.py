@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run every headless test module.
 
-.venv-qbindiff/bin/python binja_diff/tests/run_all.py
+.venv/bin/python tests/run_all.py
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ TESTS = (
     "test_cli.py",
     "test_similarity.py",
     "test_background.py",
+    "test_invariants.py",
 )
 
 #: Needs a real Binary Ninja; skips itself cleanly when unavailable.

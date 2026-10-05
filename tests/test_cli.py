@@ -6,7 +6,7 @@ verdict reaches the right column, and that identical functions stay out of the
 output unless asked for. The classification itself comes from ``core.align``
 and is covered there.
 
-    .venv-qbindiff-312/bin/python binja_diff/tests/test_cli.py
+    .venv/bin/python tests/test_cli.py
 """
 
 from __future__ import annotations
@@ -55,14 +55,7 @@ def _load_cli():
 cli = _load_cli()
 
 
-def check(label: str, condition: bool, detail: str = "") -> None:
-    status = "ok  " if condition else "FAIL"
-    print(f"  [{status}] {label}{(' -- ' + detail) if detail and not condition else ''}")
-    if not condition:
-        check.failures += 1
-
-
-check.failures = 0
+check = _bootstrap.check
 
 
 def func(bv, addr: int, name: str, texts: list[str]) -> Function:
@@ -108,6 +101,39 @@ def test_argument_contract():
             check("one binary without --list is refused", False)
         except SystemExit as exc:
             check("one binary without --list is refused", exc.code == 2, f"exit {exc.code}")
+
+
+def test_tuning_arguments_are_validated():
+    """A bad value is a parser error, not a traceback from deep inside qbindiff."""
+
+    print("matching parameters are range-checked")
+    from qbindiff import Distance
+
+    from binja_diff.core.engine import DISTANCES
+
+    check(
+        "the distance list matches qbindiff's",
+        set(cli.DISTANCES) == {d.name for d in Distance},
+        f"{sorted(cli.DISTANCES)} vs {sorted(d.name for d in Distance)}",
+    )
+    check("and the engine's", cli.DISTANCES == DISTANCES, f"{cli.DISTANCES} vs {DISTANCES}")
+    args = cli.parse_args(["--sparsity", "0.5", "--maxiter", "3", "--distance", "cosine", "a", "b"])
+    check("valid values pass", (args.sparsity, args.maxiter, args.distance) == (0.5, 3, "cosine"))
+
+    for label, argv in (
+        ("a sparsity above 1", ["--sparsity", "1.5", "a", "b"]),
+        ("a negative tradeoff", ["--tradeoff", "-0.1", "a", "b"]),
+        ("zero iterations", ["--maxiter", "0", "a", "b"]),
+        ("a negative limit", ["--limit", "-3", "a", "b"]),
+        ("an unknown distance", ["--distance", "manhattan", "a", "b"]),
+    ):
+        with contextlib.redirect_stderr(io.StringIO()):
+            try:
+                cli.parse_args(argv)
+            except SystemExit as exc:
+                check(f"{label} is refused", exc.code == 2, f"exit {exc.code}")
+            else:
+                check(f"{label} is refused", False, "accepted")
 
 
 def test_only_differences_are_listed():
@@ -183,19 +209,15 @@ def test_low_evidence_pair_is_visible():
 
 
 def main() -> int:
-    for test in (
-        test_argument_contract,
-        test_only_differences_are_listed,
-        test_report_says_what_happened,
-        test_low_evidence_pair_is_visible,
-    ):
-        test()
-    print()
-    if check.failures:
-        print(f"{check.failures} check(s) failed")
-        return 1
-    print("all checks passed")
-    return 0
+    return _bootstrap.run(
+        [
+            test_argument_contract,
+            test_tuning_arguments_are_validated,
+            test_only_differences_are_listed,
+            test_report_says_what_happened,
+            test_low_evidence_pair_is_visible,
+        ]
+    )
 
 
 if __name__ == "__main__":

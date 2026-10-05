@@ -4,7 +4,7 @@ Unlike the other test modules, this one needs a working Binary Ninja
 installation and a license that permits headless use. It is skipped
 automatically when ``binaryninja`` cannot be imported.
 
-    .venv-qbindiff-312/bin/python binja_diff/tests/test_live.py [primary] [secondary]
+    .venv/bin/python tests/test_live.py [primary] [secondary]
 
 Defaults to diffing two system binaries against each other.
 """
@@ -16,16 +16,11 @@ import sys
 import time
 from pathlib import Path
 
-#: Added by the Binary Ninja installer for GUI use; not always on sys.path
-#: for an arbitrary interpreter.
-_BN_PYTHON = Path.home() / "Documents" / "binaryninja" / "python"
-if _BN_PYTHON.is_dir() and str(_BN_PYTHON) not in sys.path:
-    sys.path.append(str(_BN_PYTHON))
-
 try:
     import binaryninja
 except Exception as exc:  # pragma: no cover - depends on the host
     print(f"SKIP: Binary Ninja is not importable here ({exc.__class__.__name__}: {exc})")
+    print('Put the API on the path: PYTHONPATH="<Binary Ninja>/Contents/Resources/python"')
     raise SystemExit(0) from None
 
 # Registered by path rather than by importing the parent directory: the
@@ -40,14 +35,7 @@ _spec.loader.exec_module(_bootstrap)
 _bootstrap.register_package()
 
 
-def check(label: str, condition: bool, detail: str = "") -> None:
-    status = "ok  " if condition else "FAIL"
-    print(f"  [{status}] {label}{(' -- ' + detail) if detail and not condition else ''}")
-    if not condition:
-        check.failures += 1
-
-
-check.failures = 0
+check = _bootstrap.check
 
 
 def pick_binaries() -> tuple[str, str]:
@@ -902,31 +890,35 @@ def main() -> int:
     primary_path, secondary_path = pick_binaries()
     print(f"primary={primary_path} secondary={secondary_path}\n")
 
-    primary_bv = binaryninja.load(primary_path)
-    secondary_bv = binaryninja.load(secondary_path)
+    # The API imports fine on a machine with only the GUI licence; it is the
+    # first load that refuses. That is the "SKIP" case too, not a failure.
     try:
-        test_backend_against_real_view(primary_bv)
-        result = test_real_diff(primary_bv, secondary_bv)
-        test_alignment_on_real_functions(result)
-        test_il_renders_on_the_first_try(result)
-        test_status_agrees_with_the_panes(result)
-        test_changes_are_visible(result)
-        test_graph_line_highlighting(result)
-        test_diff_layer_keeps_the_sides_aligned(result)
-        test_saved_diff_round_trip(result, primary_path)
-        test_kernelcache_scoping()
-        test_similarity_provider(primary_path, secondary_path)
-        test_database_round_trip(primary_path)
+        primary_bv = binaryninja.load(primary_path)
+    except RuntimeError as exc:
+        if "icense" in str(exc):
+            print(f"SKIP: {exc} (a headless licence is needed)")
+            return 0
+        raise
+    secondary_bv = binaryninja.load(secondary_path)
+    run = _bootstrap.LiveRunner()
+    try:
+        run(test_backend_against_real_view, primary_bv)
+        result = run(test_real_diff, primary_bv, secondary_bv)
+        if result is not None:
+            run(test_alignment_on_real_functions, result)
+            run(test_il_renders_on_the_first_try, result)
+            run(test_status_agrees_with_the_panes, result)
+            run(test_changes_are_visible, result)
+            run(test_graph_line_highlighting, result)
+            run(test_diff_layer_keeps_the_sides_aligned, result)
+            run(test_saved_diff_round_trip, result, primary_path)
+        run(test_kernelcache_scoping)
+        run(test_similarity_provider, primary_path, secondary_path)
+        run(test_database_round_trip, primary_path)
     finally:
         primary_bv.file.close()
         secondary_bv.file.close()
-
-    print()
-    if check.failures:
-        print(f"{check.failures} check(s) failed")
-        return 1
-    print("all checks passed")
-    return 0
+    return run.summary()
 
 
 if __name__ == "__main__":

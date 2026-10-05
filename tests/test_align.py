@@ -2,7 +2,7 @@
 
 Run with the project virtualenv:
 
-    .venv-qbindiff/bin/python binja_diff/tests/test_align.py
+    .venv/bin/python tests/test_align.py
 """
 
 from __future__ import annotations
@@ -33,17 +33,22 @@ from binja_diff.core import align  # noqa: E402
 from binja_diff.core.align import LineStatus  # noqa: E402
 
 
-def check(label: str, condition: bool, detail: str = "") -> None:
-    status = "ok  " if condition else "FAIL"
-    print(f"  [{status}] {label}{(' -- ' + detail) if detail and not condition else ''}")
-    if not condition:
-        check.failures += 1
-
-
-check.failures = 0
+check = _bootstrap.check
 
 
 def insn(text: str):
+    """One instruction from its text, typed the way the renderer types it.
+
+    A whole-line annotation (`{Case 0x114}`) and a comment are what the real
+    API hands back as ``AnnotationToken`` and ``CommentToken`` lines; the stub
+    now carries tokens, so the text alone no longer decides.
+    """
+
+    stripped = text.strip()
+    if stripped.startswith("{") and stripped.endswith("}"):
+        return ([Token(TT.AnnotationToken, text)], 4)
+    if stripped.startswith("//"):
+        return ([Token(TT.CommentToken, text)], 4)
     return ([Token(TT.InstructionToken, text)], 4)
 
 
@@ -135,6 +140,25 @@ def test_normalization():
         "normalize_line is what folds them",
         align.normalize_line("call sub_401000") == align.normalize_line("call sub_502000"),
     )
+    # `data_5598e0+8` and `data_5598e8` name the same byte: one view modelled a
+    # 16-byte variable there, the other two 8-byte ones.
+    check(
+        "compare_line resolves a decimal offset",
+        align.compare_line("ldr x0, data_5598e0+8") == align.compare_line("ldr x0, data_5598e8"),
+    )
+    check(
+        "compare_line resolves a hex offset",
+        align.compare_line("ldr x0, 0x5598e0+0x10") == align.compare_line("ldr x0, 0x5598f0"),
+    )
+    # A hex-looking offset without a prefix used to be parsed as decimal and
+    # raise, taking a whole classification batch down with it. Leaving it
+    # alone is the safe answer: the two spellings then compare `~`, not equal.
+    try:
+        unprefixed = align.compare_line("adrp x0, 0x1000+c")
+    except ValueError as exc:
+        check("an unprefixed hex offset does not raise", False, repr(exc))
+    else:
+        check("an unprefixed hex offset is left alone", unprefixed == "adrp x0, 0x1000+c")
     check(
         "compare_line collapses whitespace",
         align.compare_line("mov   eax,  ebx") == "mov eax, ebx",
@@ -363,8 +387,10 @@ def test_shape_signature():
 
     print("shape signature grades register churn as MINOR")
 
-    from binja_diff.tests.stub_binaryninja import InstructionTextTokenType as T
-    from binja_diff.tests.stub_binaryninja import Token
+    # The stub installed by bootstrap, not a second copy imported through the
+    # package: two loads of the module are two distinct enum classes.
+    T = _bootstrap.stubs().InstructionTextTokenType
+    Token = _bootstrap.stubs().Token
 
     class TokenLine:
         """Stands in for DisassemblyTextLine: tokens plus a text rendering."""
@@ -542,6 +568,23 @@ def test_block_summary():
     )
     alignment = align.align_blocks(left, right, "Disassembly")
     counts = align.summarize_blocks(alignment, left.basic_blocks, right.basic_blocks)
+    # Each matched pair carries the grade its lines got, so the summary reads
+    # it instead of aligning the same lines a second time.
+    matched = [
+        pair
+        for pair in alignment.pairs
+        if pair.left_addr is not None and pair.right_addr is not None
+    ]
+    check("matched pairs are graded", all(pair.grade is not None for pair in matched), f"{matched}")
+    check(
+        "one-sided pairs are not",
+        all(pair.grade is None for pair in alignment.pairs if pair not in matched),
+    )
+    check(
+        "the summary is read off the grades",
+        align.summarize_blocks(alignment, [], []) == counts,
+        "summarize_blocks aligned lines it was given no blocks for",
+    )
     expected = {
         "identical": 2,
         "operands only": 1,
@@ -1226,36 +1269,31 @@ def test_repeated_edit_pattern():
 
 
 def main() -> int:
-    for test in (
-        test_empty_inputs,
-        test_row_alignment_invariants,
-        test_normalization,
-        test_change_visibility,
-        test_text_similarity_counts_unchanged_lines,
-        test_function_classification,
-        test_annotations_are_not_code,
-        test_annotation_only_lines_are_not_instructions,
-        test_comments_are_not_code,
-        test_classification_runs_on_instructions_only,
-        test_il_is_generated_before_rendering,
-        test_render_levels,
-        test_anchor_row,
-        test_cursor_counterpart,
-        test_repeated_edit_pattern,
-        test_shape_signature,
-        test_side_statuses,
-        test_markers,
-        test_block_alignment_cases,
-        test_block_summary,
-        test_disjoint_functions,
-    ):
-        test()
-    print()
-    if check.failures:
-        print(f"{check.failures} check(s) failed")
-        return 1
-    print("all checks passed")
-    return 0
+    return _bootstrap.run(
+        [
+            test_empty_inputs,
+            test_row_alignment_invariants,
+            test_normalization,
+            test_change_visibility,
+            test_text_similarity_counts_unchanged_lines,
+            test_function_classification,
+            test_annotations_are_not_code,
+            test_annotation_only_lines_are_not_instructions,
+            test_comments_are_not_code,
+            test_classification_runs_on_instructions_only,
+            test_il_is_generated_before_rendering,
+            test_render_levels,
+            test_anchor_row,
+            test_cursor_counterpart,
+            test_repeated_edit_pattern,
+            test_shape_signature,
+            test_side_statuses,
+            test_markers,
+            test_block_alignment_cases,
+            test_block_summary,
+            test_disjoint_functions,
+        ]
+    )
 
 
 if __name__ == "__main__":

@@ -81,6 +81,14 @@ class AnalysisProgress:
     total: int = 0
 
 
+class LogLevel(IntEnum):
+    DebugLog = 0
+    InfoLog = 1
+    WarningLog = 2
+    ErrorLog = 3
+    AlertLog = 4
+
+
 class LinearDisassemblyLineType(IntEnum):
     BlankLineType = 0
     BasicLineType = 1
@@ -130,7 +138,14 @@ class InstructionInfo:
 
 @dataclass
 class TextLine:
+    """``DisassemblyTextLine``: text, plus the tokens and address the real one
+    carries. The tokens matter: without them ``shape_signature`` cannot answer
+    and the classifier skips a whole tier, so a stub without them tested a path
+    the plugin never takes."""
+
     text: str
+    tokens: list = field(default_factory=list)
+    address: int = 0
 
     def __str__(self) -> str:
         return self.text
@@ -164,7 +179,7 @@ class BasicBlock:
         lines = []
         addr = self.start
         for tokens, length in self.instructions:
-            lines.append(TextLine("".join(t.text for t in tokens)))
+            lines.append(TextLine("".join(t.text for t in tokens), list(tokens), addr))
             addr += length
         return lines
 
@@ -286,6 +301,41 @@ class BinaryView:
         return None
 
 
+class BackgroundTaskThread:
+    """The real one runs ``run`` on a thread; this runs it inline from ``start``.
+
+    Synchronous on purpose: a test that constructs a task and calls ``start``
+    sees its callbacks fire before ``start`` returns, with nothing to wait on.
+    The attributes are the properties the real class exposes
+    (binaryninja-api/python/plugin.py), so a task written against it reads the
+    same here, and ``finish`` runs on every exit of ``run`` as it does there.
+    """
+
+    def __init__(self, initial_progress_text: str = "", can_cancel: bool = False):
+        self.progress = initial_progress_text
+        self.can_cancel = can_cancel
+        self.cancelled = False
+        self.finished = False
+
+    def run(self) -> None:
+        pass
+
+    def start(self) -> None:
+        try:
+            self.run()
+        finally:
+            self.finish()
+
+    def join(self, timeout=None) -> None:
+        pass
+
+    def cancel(self) -> None:
+        self.cancelled = True
+
+    def finish(self) -> None:
+        self.finished = True
+
+
 def install() -> None:
     """Register the stub modules in ``sys.modules``."""
 
@@ -294,8 +344,10 @@ def install() -> None:
     bn.BinaryView = BinaryView
     bn.Function = Function
     bn.BasicBlock = BasicBlock
-    bn.BackgroundTaskThread = object
+    bn.BackgroundTaskThread = BackgroundTaskThread
+    bn.LogLevel = LogLevel
     bn.log_info = bn.log_warn = bn.log_error = bn.log_debug = lambda *a, **k: None
+    bn.log_to_stderr = lambda level: None
     bn.load = lambda *a, **k: None
     bn.execute_on_main_thread = lambda fn: fn()
     bn.DisassemblySettings = lambda *a, **k: None
@@ -309,6 +361,7 @@ def install() -> None:
     enums.InstructionTextTokenType = InstructionTextTokenType
     enums.FunctionGraphType = FunctionGraphType
     enums.AnalysisState = AnalysisState
+    enums.LogLevel = LogLevel
     enums.LinearDisassemblyLineType = LinearDisassemblyLineType
     bn.enums = enums
 

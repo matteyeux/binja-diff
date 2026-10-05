@@ -6,7 +6,7 @@ which is not ours is rejected rather than half-read, and that a binary which
 changed underneath the saved diff is noticed — a restore that silently pairs
 the wrong functions is worse than no restore at all.
 
-    .venv-qbindiff-312/bin/python binja_diff/tests/test_persist.py
+    .venv/bin/python tests/test_persist.py
 """
 
 from __future__ import annotations
@@ -15,6 +15,8 @@ import importlib.util
 import json
 import tempfile
 from pathlib import Path
+from types import ModuleType
+from typing import cast
 
 _spec = importlib.util.spec_from_file_location(
     "_bootstrap", Path(__file__).resolve().parent / "bootstrap.py"
@@ -28,14 +30,7 @@ from binja_diff.core import persist  # noqa: E402
 from binja_diff.core.engine import DiffOptions, DiffResult, FunctionRef, MatchRecord  # noqa: E402
 
 
-def check(label: str, condition: bool, detail: str = "") -> None:
-    status = "ok  " if condition else "FAIL"
-    print(f"  [{status}] {label}{(' -- ' + detail) if detail and not condition else ''}")
-    if not condition:
-        check.failures += 1
-
-
-check.failures = 0
+check = _bootstrap.check
 
 
 def make_view(name: str, size: int = 64, functions: int = 3):
@@ -73,6 +68,24 @@ def test_round_trip():
     check("secondary path preserved", back.secondary.filename == "/tmp/b.bin")
     check("options recorded", back.options.get("distance") == "haussmann", f"{back.options}")
     check("creation time recorded", bool(back.created))
+    check("an unscoped diff saves an empty scope", back.scope == [], f"{back.scope}")
+
+    result.scope = ["AppleSEPManager"]
+    scoped = persist.SavedDiff.from_json(persist.SavedDiff.from_result(result).to_json())
+    check(
+        "the scope survives the round trip", scoped.scope == ["AppleSEPManager"], f"{scoped.scope}"
+    )
+    check(
+        "and reaches the restored result",
+        scoped.to_result(result.primary_bv, result.secondary_bv).scope == ["AppleSEPManager"],
+    )
+    # A file written before the key existed is still ours to read.
+    legacy = persist.SavedDiff.from_result(result).to_dict()
+    del legacy["scope"]
+    check(
+        "a payload without a scope reads as unscoped",
+        persist.SavedDiff.from_dict(legacy).scope == [],
+    )
 
     restored = back.to_result(result.primary_bv, result.secondary_bv)
     check("indexes rebuilt", 0x1000 in restored.by_primary and 0x2100 in restored.by_secondary)
@@ -198,24 +211,175 @@ def test_summary():
     check("counts the matches", "2 matches" in summary, summary)
 
 
+def test_minimal_payload_reads():
+    """Additive keys are read with ``get``: a file from an older plugin, which
+    has none of them, still restores."""
+
+    print("a payload with only the required keys reads")
+    saved = persist.SavedDiff.from_dict({"format": persist.FORMAT, "version": persist.VERSION})
+    check("no matches is fine", saved.matches == [] and saved.scope == [] and saved.options == {})
+    check(
+        "a missing version reads as the oldest",
+        persist.SavedDiff.from_dict({"format": persist.FORMAT}).version == 0,
+    )
+
+
+def test_database_presence_queries():
+    print("has_saved_diff and is_persistent answer without parsing")
+    bv = make_view("/tmp/a.bin")
+    check("nothing saved yet", not persist.has_saved_diff(bv))
+    persist.store_in_database(bv, persist.SavedDiff.from_result(make_result()))
+    check("a stored diff is seen", persist.has_saved_diff(bv))
+    check("an unsaved view is not persistent", not persist.is_persistent(bv))
+    bv.file.has_database = True
+    check("a database is", persist.is_persistent(bv))
+
+    class Broken:
+        @property
+        def file(self):
+            raise RuntimeError("closed")
+
+    check("a view that cannot answer is not persistent", not persist.is_persistent(Broken()))
+
+
+def test_timings_are_not_saved():
+    print("timings describe the run, not the result")
+    result = make_result()
+    result.timings = [("Matching functions", 720.0)]
+    check(
+        "no timings key in the payload",
+        "timings" not in persist.SavedDiff.from_result(result).to_dict(),
+    )
+
+
+def _sep_pair(api_names):
+    """Two SEP container views, empty until a part is mapped, plus the fake loader."""
+
+    from binja_diff.core import scope
+
+    stubs = _bootstrap.stubs()
+    views = []
+    for name in ("/tmp/sep-a.bin", "/tmp/sep-b.bin"):
+        bv = stubs.BinaryView(name, b"\x00" * 64)
+        bv.view_type = scope.SEP_VIEW
+        views.append(bv)
+    return views
+
+
+class _FakeSepApi:
+    API_VERSION = 3
+
+    def __init__(self, names):
+        self.names = names
+        self.loaded: list[tuple[str, list[str]]] = []
+
+    def module_names(self, bv):
+        return list(self.names)
+
+    def load_modules(self, bv, names):
+        names = list(names)
+        if any(name not in self.names for name in names):
+            return False
+        self.loaded.append((bv.file.filename, names))
+        stubs = _bootstrap.stubs()
+        for name in names:
+            section = f"{name}:__TEXT:__text"
+            bv.sections[section] = stubs.Section(section, 0x1000, 0x2000)
+        return True
+
+
+def test_restoring_a_container_diff_maps_its_parts_back():
+    """A saved diff of one SEP module names it, and a restore has to map that
+    module into both views before a single saved address resolves."""
+
+    print("restoring a scoped diff loads the parts on both sides")
+    import sys
+
+    from binja_diff.core import scope
+
+    api = _FakeSepApi(["SEPOS", "SEPD"])
+    # Published the way sep-binja publishes it: as an entry in sys.modules that
+    # is looked up, never imported, so it need not be a module.
+    sys.modules[scope._SEP_API_KEY] = cast(ModuleType, api)
+    try:
+        primary, secondary = _sep_pair(api.names)
+        saved = persist.SavedDiff.from_result(make_result())
+        saved.scope = ["SEPD"]
+        events: list = []
+        task = persist.RestoreTask(
+            primary,
+            saved,
+            secondary,
+            on_done=lambda result: events.append(("done", result)),
+            on_error=lambda message: events.append(("error", message)),
+        )
+        task.start()
+        check("the restore completed", [kind for kind, _ in events] == ["done"], f"{events}")
+        check(
+            "the part was mapped into both views",
+            api.loaded == [("/tmp/sep-a.bin", ["SEPD"]), ("/tmp/sep-b.bin", ["SEPD"])],
+            f"{api.loaded}",
+        )
+        check(
+            "both views were analyzed once",
+            (primary.analysis_waits, secondary.analysis_waits) == (1, 1),
+        )
+        if events and events[0][0] == "done":
+            check("the result carries the scope", events[0][1].scope == ["SEPD"])
+
+        # A part the file does not have is an error the user can act on, not a
+        # table full of missing functions.
+        primary, secondary = _sep_pair(api.names)
+        saved.scope = ["AESS"]
+        events.clear()
+        persist.RestoreTask(
+            primary,
+            saved,
+            secondary,
+            on_done=lambda result: events.append(("done", result)),
+            on_error=lambda message: events.append(("error", message)),
+        ).start()
+        check(
+            "a missing part fails the restore",
+            bool(events) and events[0][0] == "error",
+            f"{events}",
+        )
+        check("and names it", bool(events) and "AESS" in events[0][1], f"{events}")
+
+        # Unscoped saves still restore without touching the loader.
+        plain_saved = persist.SavedDiff.from_result(make_result())
+        before = list(api.loaded)
+        events.clear()
+        persist.RestoreTask(
+            make_view("/tmp/a.bin"),
+            plain_saved,
+            make_view("/tmp/b.bin"),
+            on_done=lambda result: events.append(("done", result)),
+            on_error=lambda message: events.append(("error", message)),
+        ).start()
+        check("an unscoped restore completes", bool(events) and events[0][0] == "done", f"{events}")
+        check("without loading anything", api.loaded == before)
+    finally:
+        sys.modules.pop(scope._SEP_API_KEY, None)
+
+
 def main() -> int:
-    for test in (
-        test_round_trip,
-        test_rejects_foreign_payloads,
-        test_rejects_newer_version,
-        test_truncated_payload,
-        test_database_sink,
-        test_file_sink,
-        test_drift_detection,
-        test_summary,
-    ):
-        test()
-    print()
-    if check.failures:
-        print(f"{check.failures} check(s) failed")
-        return 1
-    print("all checks passed")
-    return 0
+    return _bootstrap.run(
+        [
+            test_round_trip,
+            test_rejects_foreign_payloads,
+            test_rejects_newer_version,
+            test_truncated_payload,
+            test_database_sink,
+            test_file_sink,
+            test_drift_detection,
+            test_summary,
+            test_minimal_payload_reads,
+            test_database_presence_queries,
+            test_timings_are_not_saved,
+            test_restoring_a_container_diff_maps_its_parts_back,
+        ]
+    )
 
 
 if __name__ == "__main__":
